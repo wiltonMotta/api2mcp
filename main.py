@@ -850,6 +850,33 @@ async def submit_job(
 ) -> dict:
     username = get_current_username()
 
+    # --- P1-5: Parameter validation ---
+
+    # B03: Reject empty GAP_CMD_FILE
+    if not GAP_CMD_FILE or not GAP_CMD_FILE.strip():
+        return {
+            "error": True,
+            "message": "GAP_CMD_FILE（作业命令）不能为空。",
+        }
+
+    # Mutual exclusion: GAP_NNODE vs GAP_NODE_STRING
+    if GAP_NNODE is not None and GAP_NODE_STRING is not None:
+        if GAP_NNODE.strip() and GAP_NODE_STRING.strip():
+            return {
+                "error": True,
+                "message": "GAP_NNODE 和 GAP_NODE_STRING 互斥，不能同时填写。"
+                           "请只选择一种方式指定节点：指定数量（GAP_NNODE）或指定具体节点（GAP_NODE_STRING）。",
+            }
+
+    # Mutual exclusion: GAP_NPROC vs GAP_PPN
+    if GAP_NPROC is not None and GAP_PPN is not None:
+        if GAP_NPROC.strip() and GAP_PPN.strip():
+            return {
+                "error": True,
+                "message": "GAP_NPROC 和 GAP_PPN 互斥，不能同时填写。"
+                           "请只选择一种方式指定核心数：总核心数（GAP_NPROC）或每节点核心数（GAP_PPN）。",
+            }
+
     # 1. Auth check
     conn = get_db()
     try:
