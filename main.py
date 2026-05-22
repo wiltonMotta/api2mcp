@@ -111,7 +111,7 @@ AUTH_PAGE_HTML = """\
       <input type="password" name="secretKey" required placeholder="Your SK">
     </label>{error_html}
     <button type="submit">Authenticate</button>
-    <p class="user">How to get AK/SK?</p>
+    <p class="user">How to get my Access Key & Secret Key?</p>
   </form>
 </div>
 </body>
