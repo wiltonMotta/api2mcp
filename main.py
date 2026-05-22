@@ -425,55 +425,55 @@ async def auth_submit(request: Request) -> HTMLResponse:
     client = _get_http_client(timeout=30.0)
     try:
         resp = await client.post(SCNET_TOKEN_URL, headers=headers, json={})
-            resp.raise_for_status()
-            token_data = resp.json()
+        resp.raise_for_status()
+        token_data = resp.json()
 
-            # Validate SCNet API response code
-            api_code = str(token_data.get("code", ""))
-            if api_code != "0":
-                api_msg = token_data.get("msg", "Unknown error")
+        # Validate SCNet API response code
+        api_code = str(token_data.get("code", ""))
+        if api_code != "0":
+            api_msg = token_data.get("msg", "Unknown error")
 
-                if "不存在" in api_msg:
-                    hint = (
-                        "The Access Key / Secret Key pair was not found. "
-                        "Please verify: (1) The keys were copied correctly from the "
-                        "Access Control page without extra spaces or line breaks. "
-                        "(2) Access Key goes in the first field and Secret Key in the second. "
-                        "(3) The keys have not been revoked or regenerated."
-                    )
-                elif "非本人" in api_msg:
-                    hint = (
-                        "The AK/SK you provided belong to a different SCNet user, "
-                        f"not <strong>{html_mod.escape(username)}</strong>. "
-                        "Please use the AK/SK that matches this account."
-                    )
-                else:
-                    hint = f"SCNet API error: {html_mod.escape(api_msg)} (code={api_code})"
-
-                return HTMLResponse(
-                    ERROR_PAGE_HTML.format(
-                        username=safe_username,
-                        message=hint,
-                    ),
-                    status_code=400,
+            if "不存在" in api_msg:
+                hint = (
+                    "The Access Key / Secret Key pair was not found. "
+                    "Please verify: (1) The keys were copied correctly from the "
+                    "Access Control page without extra spaces or line breaks. "
+                    "(2) Access Key goes in the first field and Secret Key in the second. "
+                    "(3) The keys have not been revoked or regenerated."
                 )
-        except httpx.HTTPStatusError as exc:
+            elif "非本人" in api_msg:
+                hint = (
+                    "The AK/SK you provided belong to a different SCNet user, "
+                    f"not <strong>{html_mod.escape(username)}</strong>. "
+                    "Please use the AK/SK that matches this account."
+                )
+            else:
+                hint = f"SCNet API error: {html_mod.escape(api_msg)} (code={api_code})"
+
             return HTMLResponse(
                 ERROR_PAGE_HTML.format(
                     username=safe_username,
-                    message=f"SCNet API error (HTTP {exc.response.status_code}): "
-                            f"{exc.response.text[:300]}",
+                    message=hint,
                 ),
-                status_code=502,
+                status_code=400,
             )
-        except Exception as exc:
-            return HTMLResponse(
-                ERROR_PAGE_HTML.format(
-                    username=safe_username,
-                    message=f"Request failed: {html_mod.escape(str(exc))}",
-                ),
-                status_code=502,
-            )
+    except httpx.HTTPStatusError as exc:
+        return HTMLResponse(
+            ERROR_PAGE_HTML.format(
+                username=safe_username,
+                message=f"SCNet API error (HTTP {exc.response.status_code}): "
+                        f"{exc.response.text[:300]}",
+            ),
+            status_code=502,
+        )
+    except Exception as exc:
+        return HTMLResponse(
+            ERROR_PAGE_HTML.format(
+                username=safe_username,
+                message=f"Request failed: {html_mod.escape(str(exc))}",
+            ),
+            status_code=502,
+        )
 
     # 2. Parse clusters from response
     clusters = token_data.get("data", token_data)
