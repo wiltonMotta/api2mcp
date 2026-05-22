@@ -214,6 +214,35 @@ def migrate_db() -> None:
 # Auth utilities
 # ---------------------------------------------------------------------------
 
+AUTH_BASE_URL = "https://c-2056205187675406338.qdai.scnet.cn:58043"
+
+
+def check_auth(username: str) -> dict | None:
+    """Check whether a user is authenticated.
+
+    Returns ``None`` if authenticated, otherwise returns an error ``dict``
+    with ``error=True``, ``message``, and ``auth_url`` fields.
+    """
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT acToken FROM users WHERE userName = ?", (username,)
+        ).fetchone()
+    finally:
+        conn.close()
+
+    if row is None or row["acToken"] is None:
+        return {
+            "error": True,
+            "message": (
+                f"用户 '{username}' 未认证。"
+                "请先访问认证页面获取访问凭证。"
+            ),
+            "auth_url": f"{AUTH_BASE_URL}/auth/{username}",
+        }
+    return None
+
+
 def get_current_username() -> str:
     request = _current_http_request.get()
     if request is None:
