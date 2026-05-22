@@ -991,7 +991,7 @@ async def submit_job(
             "error": True,
             "message": "集群未配置有效的 HPC 服务 URL。",
         }
-    _url_idx = getattr(_url_idx_ctx, str(clusterId), 0)
+    _url_idx = _url_idx_ctx.get(str(clusterId), 0)
     base_url = valid_urls[_url_idx % len(valid_urls)]
     _url_idx_ctx[str(clusterId)] = _url_idx + 1
     job_manager_id = None
