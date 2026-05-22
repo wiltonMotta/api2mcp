@@ -12,7 +12,6 @@ import html as html_mod
 import inspect
 import json
 import os
-import random
 import re
 import sqlite3
 import time as time_mod
@@ -182,6 +181,9 @@ ERROR_PAGE_HTML = """\
 # ---------------------------------------------------------------------------
 # Database helpers
 # ---------------------------------------------------------------------------
+
+# Round-robin URL index context for P1-3 (replaces random.choice)
+_url_idx_ctx: dict[str, int] = {}
 
 mcp = FastMCP("SCNet OpenAPI MCP Server", on_duplicate="ignore")
 
