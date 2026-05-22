@@ -24,6 +24,13 @@ from pydantic import Field
 from starlette.requests import Request
 from starlette.responses import HTMLResponse
 
+# P1-2: Module-level httpx client for connection reuse
+def _get_http_client(timeout: float = 30.0) -> httpx.AsyncClient:
+    """Return a shared AsyncClient instance. Reuses the same connection pool."""
+    if not hasattr(_get_http_client, "_client"):
+        _get_http_client._client = httpx.AsyncClient(timeout=timeout)
+    return _get_http_client._client
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -940,7 +947,15 @@ async def submit_job(
         }
 
     # 3. Get jobManagerID from cluster API
-    base_url = random.choice(hpc_urls.split(",")).strip().rstrip("/")
+    valid_urls = [u.strip().rstrip("/") for u in hpc_urls.split(",") if u.strip()]
+    if not valid_urls:
+        return {
+            "error": True,
+            "message": "集群未配置有效的 HPC 服务 URL。",
+        }
+    _url_idx = getattr(_url_idx_ctx, str(clusterId), 0)
+    base_url = valid_urls[_url_idx % len(valid_urls)]
+    _url_idx_ctx[str(clusterId)] = _url_idx + 1
     job_manager_id = None
 
     try:
