@@ -74,11 +74,16 @@ Body:
 
 ## 后端处理逻辑
 
-1. **认证校验**：检查 `users` 表中是否有 `acToken`
-2. **获取集群凭据**：根据 `clusterId` + `username` 从 `user_cluster` 表查询 `token`
-3. **获取调度器 ID**：从 `cluster_url` 表获取 `hpcUrls`，随机选取一个作为 `base_url`，调用 `GET {base_url}/hpc/openapi/v2/cluster` 获取 `jobManagerID`
-4. **生成 GAP_JOB_NAME**：根据用户的 `GAP_CMD_FILE` 由大模型生成一个简洁且有语义的作业名称
-5. **填充默认值**：
+1. **参数校验**：
+   - `GAP_CMD_FILE` 不能为空，否则返回错误
+   - `GAP_NNODE` 与 `GAP_NODE_STRING` 不能同时填写有效值（互斥校验）
+   - `GAP_NPROC` 与 `GAP_PPN` 不能同时填写有效值（互斥校验）
+2. **认证校验**：检查 `users` 表中是否有 `acToken`
+3. **获取集群凭据**：根据 `clusterId` + `username` 从 `user_cluster` 表查询 `token`
+4. **homePath 校验**：用户的 `homePath` 不能为空，否则返回错误（防止路径安全漏洞）
+5. **获取调度器 ID**：从 `cluster_url` 表获取 `hpcUrls`，按轮询（round-robin）选取一个作为 `base_url`（而非随机），调用 `GET {base_url}/hpc/openapi/v2/cluster` 获取 `jobManagerID`
+6. **生成 GAP_JOB_NAME**：根据用户的 `GAP_CMD_FILE` 提取第一个词 + 时间戳作为作业名称
+7. **填充默认值**：
    - `GAP_NNODE`：若未传值，使用 `"1"`
    - `GAP_NODE_STRING`：若未传值，使用 `""`
    - `GAP_WALL_TIME`：若未传值，使用 `"24:00:00"`
@@ -86,8 +91,8 @@ Body:
    - `GAP_WORK_DIR`：若未传值，拼接 `homePath + "/_job_" + 当前时间戳(YYYY_mm_dd_HHiiss)`
    - `GAP_STD_OUT_FILE`：若未传值，使用 `{GAP_WORK_DIR}/std.out.%j`
    - `GAP_STD_ERR_FILE`：若未传值，使用 `{GAP_WORK_DIR}/std.err.%j`
-6. **构建嵌套请求体**：按官方 API 结构组装，顶层包含 `apptype`、`appname`、`strJobManagerID`，作业参数放入 `mapAppJobInfo`
-7. **提交作业**：POST 到 `{hpcUrls}/hpc/openapi/v2/apptemplates/{apptype}/{appname}/job`
+8. **构建嵌套请求体**：按官方 API 结构组装，顶层包含 `apptype`、`appname`、`strJobManagerID`，作业参数放入 `mapAppJobInfo`
+9. **提交作业**：POST 到 `{base_url}/hpc/openapi/v2/apptemplates/{apptype}/{appname}/job`
 
 ## API 调用
 
