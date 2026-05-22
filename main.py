@@ -591,20 +591,38 @@ async def auth_submit(request: Request) -> HTMLResponse:
 # MCP Tools
 # ---------------------------------------------------------------------------
 
+def _infer_type(value: Any) -> str:
+    """Map a Python value to an OpenAPI-like type string."""
+    if value is None:
+        return "any"
+    py_type = type(value).__name__
+    type_map = {
+        "int": "integer", "float": "number", "str": "string",
+        "bool": "boolean", "list": "array", "dict": "object",
+    }
+    return type_map.get(py_type, "string")
+
+
 def _build_return_schema(data: Any) -> dict | None:
-    """Build a returns.schema dict from sample data keys."""
+    """Build a returns.schema dict from sample data keys.
+
+    Handles nested dicts/lists and provides a default schema for empty data.
+    """
     schema: dict = {}
     if isinstance(data, dict):
         for key, value in data.items():
-            py_type = type(value).__name__
-            type_map = {"int": "integer", "float": "number", "str": "string",
-                         "bool": "boolean", "list": "array", "dict": "object"}
+            if isinstance(value, dict):
+                value = "<object>"
+            elif isinstance(value, list):
+                value = "<array>"
             schema[key] = {
-                "type": type_map.get(py_type, "string"),
+                "type": _infer_type(value),
                 "description": key,
                 "optional": True,
             }
-    return schema if schema else None
+    return schema if schema else {
+        "status": {"type": "string", "description": "Response status", "optional": False},
+    }
 
 
 @mcp.tool()
