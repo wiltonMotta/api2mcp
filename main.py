@@ -705,7 +705,15 @@ async def list_available_partitions() -> list[dict]:
         if not hpc_urls:
             continue
 
-        base_url = random.choice(hpc_urls.split(",")).strip().rstrip("/")
+        # P0-4: Filter empty URLs
+        valid_urls = [u.strip().rstrip("/") for u in hpc_urls.split(",") if u.strip()]
+        if not valid_urls:
+            continue
+
+        # P1-3: Round-robin via index counter
+        _url_idx = getattr(_url_idx_ctx, str(cid), 0)
+        base_url = valid_urls[_url_idx % len(valid_urls)]
+        _url_idx_ctx[str(cid)] = _url_idx + 1
 
         cluster_result: dict = {"clusterId": cid, "clusterName": cname}
 
@@ -718,6 +726,9 @@ async def list_available_partitions() -> list[dict]:
                 )
                 ci_resp.raise_for_status()
                 ci_data = ci_resp.json()
+
+            if not isinstance(ci_data, dict):
+                continue
 
             cluster_list = ci_data.get("data", ci_data)
             if isinstance(cluster_list, list) and cluster_list:
@@ -744,6 +755,9 @@ async def list_available_partitions() -> list[dict]:
                 )
                 q_resp.raise_for_status()
                 q_data = q_resp.json()
+
+            if not isinstance(q_data, dict):
+                continue
 
             queues = q_data.get("data", q_data)
             if isinstance(queues, list):
