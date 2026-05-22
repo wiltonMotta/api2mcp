@@ -57,8 +57,8 @@ Body:
 | `clusterId` | integer | 是 | 从 `list_available_partitions` 返回结果中选定的集群 ID |
 | `queueName` | string | 是 | 从选定集群的 `queues` 列表中选择的目标队列名称（对应队列对象的 `queName` 字段） |
 | `GAP_CMD_FILE` | string | 是 | 作业要执行的命令行内容（如需换行，使用 `\n` 转义）。例如：`sleep 500`、`python train.py` |
-| `GAP_NNODE` | string | 否 | 节点个数。与 `GAP_NODE_STRING` 互斥——指定 `GAP_NNODE` 时 `GAP_NODE_STRING` 必须为 `""`。默认 `"1"` |
-| `GAP_NODE_STRING` | string | 否 | 指定具体节点。与 `GAP_NNODE` 互斥——指定 `GAP_NODE_STRING` 时 `GAP_NNODE` 必须为 `""`。默认 `""` |
+| `GAP_NNODE` | string | 否 | 节点个数。与 `GAP_NODE_STRING` 互斥——两者不能同时填写有效值。默认 `"1"` |
+| `GAP_NODE_STRING` | string | 否 | 指定具体节点。与 `GAP_NNODE` 互斥——两者不能同时填写有效值。默认 `""` |
 | `GAP_WALL_TIME` | string | 否 | 最大运行时长，格式 `HH:MM:ss`。默认 `"24:00:00"` |
 | `GAP_NPROC` | string | 否 | 总核心数（`GAP_NPROC` 和 `GAP_PPN` 选其一填写） |
 | `GAP_PPN` | string | 否 | CPU核心/节点（`GAP_NPROC` 和 `GAP_PPN` 选其一填写） |
