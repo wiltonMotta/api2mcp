@@ -96,8 +96,8 @@ Body:
 
 ## API 调用
 
-- URL: `{hpcUrls}/hpc/openapi/v2/apptemplates/{apptype}/{appname}/job`
-  - `{hpcUrls}` 为从 `cluster_url` 表中获取的集群 URL（随机选取）
+- URL: `{base_url}/hpc/openapi/v2/apptemplates/{apptype}/{appname}/job`
+  - `{base_url}` 为从 `cluster_url` 表中获取的 `hpcUrls` 中按轮询选取的 URL
   - `{apptype}` 默认为 `BASIC`
   - `{appname}` 默认为 `BASE`
 - Method: POST
