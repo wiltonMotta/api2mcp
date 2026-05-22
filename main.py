@@ -701,6 +701,10 @@ def _build_return_schema(data: Any) -> dict | None:
 async def get_user_info() -> dict:
     username = get_current_username()
 
+    auth_err = check_auth(username)
+    if auth_err:
+        return auth_err
+
     conn = get_db()
     try:
         row = conn.execute(
@@ -708,16 +712,6 @@ async def get_user_info() -> dict:
         ).fetchone()
     finally:
         conn.close()
-
-    if row is None or row["acToken"] is None:
-        return {
-            "error": True,
-            "message": (
-                f"User '{username}' is not authenticated. "
-                "Please visit the authentication page to obtain access credentials."
-            ),
-            "auth_url": f"https://c-2056205187675406338.qdai.scnet.cn:58043/auth/{username}",
-        }
 
     token = row["acToken"]
 
