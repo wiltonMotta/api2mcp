@@ -113,7 +113,7 @@ AUTH_PAGE_HTML = """\
       <input type="password" name="secretKey" required placeholder="Your SK">
     </label>{error_html}
     <button type="submit">Authenticate</button>
-    <a class="user" href='https://www.scnet.cn/ui/console/index.html#/personal/auth-manage'>Get Access Key & Secret Key</a>
+    <a class="btn-link" href='https://www.scnet.cn/ui/console/index.html#/personal/auth-manage' target="_blank">Get Access Key & Secret Key</a>
   </form>
 </div>
 </body>
