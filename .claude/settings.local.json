@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cat)",
+      "Bash(echo \"Write exit code: $?\")",
+      "Bash(echo \"SQL created: $?\")",
+      "Read(//tmp/**)",
+      "Bash(curl -s \"https://www.scnet.cn/ac/openapi/doc/2.0/api/jobmanager/job.html\" -L --max-time 15)",
+      "Bash(curl *)",
+      "Bash(echo \"INSERT SQL created: $?\")",
+      "Bash(python *)",
+      "Bash(python main.py)",
+      "Bash(echo \"Server PID: $!\")",
+      "Bash(echo \"exit: $?\")",
+      "Bash(nginx -v)",
+      "Bash(echo \"port check exit: $?\")"
+    ]
+  }
+}
