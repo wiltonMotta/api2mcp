@@ -955,7 +955,7 @@ async def submit_job(
     finally:
         conn.close()
 
-    if row is None or row["token"] is None:
+    if row is None:
         return {
             "error": True,
             "message": (
@@ -963,6 +963,7 @@ async def submit_job(
                 "请先调用 list_available_partitions 获取可用队列，然后选择有效的集群。"
             ),
         }
+    if row["token"] is None:
 
     if not row["hpcUrls"]:
         return {
