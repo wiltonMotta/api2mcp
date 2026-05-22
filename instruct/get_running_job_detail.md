@@ -19,7 +19,8 @@
 | 参数名 | 类型 | 必填 | 默认值 / 来源说明 |
 |--------|------|------|-------------------|
 | `jobId` | string | 是 | 作业 ID（可从 `submit_job` 返回的 `jobID` 字段获取） |
-| `token` | string | 是 | token（可从 `submit_job` 返回的 `token` 字段获取） |
+| `token` | string | 否 | token（可从 `submit_job` 返回的 `token` 字段获取） |
+| `hpcUrls` | string | 否 | hpcUrls（可从 `submit_job` 返回的 `hpcUrls` 字段获取） |
 
 ## 后端处理逻辑
 
