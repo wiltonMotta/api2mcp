@@ -947,7 +947,7 @@ async def submit_job(
             "error": True,
             "message": (
                 f"未在集群 clusterId={clusterId} 中找到您的认证凭证。"
-                "请先调用 list_available_partitions 获取可用队列，然后选择有效的集群。"
+                " 请先调用 list_available_partitions 获取可用队列，然后选择有效的集群。"
             ),
         }
 
