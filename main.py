@@ -1220,7 +1220,7 @@ async def get_running_job_detail(
             return {
                 "error": True,
                 "message": (
-                    f"集群 {row.get('clusterName', clusterId)} 未配置 HPC 服务 URL。"
+                    f"集群 {clusterId} 未配置 HPC 服务 URL。"
                     "请联系管理员配置集群信息。"
                 ),
             }
