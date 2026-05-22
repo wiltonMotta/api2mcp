@@ -760,13 +760,13 @@ async def list_available_partitions() -> list[dict]:
 
         try:
             # 1. Get cluster info → extract strJobManagerID
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                ci_resp = await client.get(
-                    f"{base_url}/hpc/openapi/v2/cluster",
-                    headers={"token": token, "Content-Type": "application/json"},
-                )
-                ci_resp.raise_for_status()
-                ci_data = ci_resp.json()
+            client = _get_http_client(timeout=30.0)
+            ci_resp = await client.get(
+                f"{base_url}/hpc/openapi/v2/cluster",
+                headers={"token": token, "Content-Type": "application/json"},
+            )
+            ci_resp.raise_for_status()
+            ci_data = ci_resp.json()
 
             if not isinstance(ci_data, dict):
                 continue
@@ -789,13 +789,12 @@ async def list_available_partitions() -> list[dict]:
                 f"{base_url}/hpc/openapi/v2/queuenames/users/{username}"
                 f"?strJobManagerID={job_manager_id}"
             )
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                q_resp = await client.get(
-                    queue_url,
-                    headers={"token": token, "Content-Type": "application/json"},
-                )
-                q_resp.raise_for_status()
-                q_data = q_resp.json()
+            q_resp = await client.get(
+                queue_url,
+                headers={"token": token, "Content-Type": "application/json"},
+            )
+            q_resp.raise_for_status()
+            q_data = q_resp.json()
 
             if not isinstance(q_data, dict):
                 continue
