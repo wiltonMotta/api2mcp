@@ -620,7 +620,7 @@ async def get_user_info() -> dict:
                 f"User '{username}' is not authenticated. "
                 "Please visit the authentication page to obtain access credentials."
             ),
-            "auth_url": f"/auth/{username}",
+            "auth_url": f"https://c-2056205187675406338.qdai.scnet.cn:58043/auth/{username}",
         }
 
     token = row["acToken"]
