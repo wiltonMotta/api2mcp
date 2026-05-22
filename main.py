@@ -870,6 +870,13 @@ async def submit_job(
     hpc_urls = row["hpcUrls"]
     home_path = row["homePath"] or ""
 
+    # P0-2: Reject empty homePath to prevent path traversal
+    if not home_path:
+        return {
+            "error": True,
+            "message": "用户 homePath 未配置，请联系管理员配置集群信息。",
+        }
+
     # 3. Get jobManagerID from cluster API
     base_url = random.choice(hpc_urls.split(",")).strip().rstrip("/")
     job_manager_id = None
