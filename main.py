@@ -754,9 +754,9 @@ async def get_user_info() -> dict:
 async def list_available_partitions() -> list[dict]:
     username = get_current_username()
 
-    auth_err = check_auth(username)
-    if isinstance(auth_err, dict):
-        return [auth_err]
+    auth_result = check_auth(username)
+    if isinstance(auth_result, dict):
+        return [auth_result]
 
     # Get all clusters for this user with their URLs
     conn = get_db()
