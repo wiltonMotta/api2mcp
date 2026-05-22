@@ -422,7 +422,8 @@ async def auth_submit(request: Request) -> HTMLResponse:
         "timestamp": timestamp,
     }
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    client = _get_http_client(timeout=30.0)
+    try:
         try:
             resp = await client.post(SCNET_TOKEN_URL, headers=headers, json={})
             resp.raise_for_status()
@@ -532,15 +533,15 @@ async def auth_submit(request: Request) -> HTMLResponse:
 
     # 3. For each non-ac cluster, call get-center-info
     cluster_names: list[str] = []
+    client = _get_http_client(timeout=30.0)
     for cl in other_clusters:
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                ci_resp = await client.get(
-                    SCNET_CENTER_URL,
-                    headers={"token": cl["token"], "Content-Type": "application/json"},
-                )
-                ci_resp.raise_for_status()
-                ci_data = ci_resp.json()
+            ci_resp = await client.get(
+                SCNET_CENTER_URL,
+                headers={"token": cl["token"], "Content-Type": "application/json"},
+            )
+            ci_resp.raise_for_status()
+            ci_data = ci_resp.json()
         except Exception:
             continue
 
