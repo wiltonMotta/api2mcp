@@ -355,10 +355,10 @@ def make_proxy_tool(name: str, doc: dict):
         else:
             query_params = remaining or None
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.request(
-                method=method, url=url, params=query_params, json=json_body,
-            )
+        client = _get_http_client(timeout=30.0)
+        response = await client.request(
+            method=method, url=url, params=query_params, json=json_body,
+        )
         try:
             return response.json()
         except ValueError:
