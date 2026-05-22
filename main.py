@@ -1056,21 +1056,21 @@ async def submit_job(
 @mcp.tool()
 async def get_running_job_detail(
     jobId: Annotated[str, Field(description="作业 ID，可从 submit_job 返回的 jobID 字段获取")],
-    token: Annotated[str, Field(description="token（可从 submit_job 返回的 token 字段获取")],
-    hpcUrls: Annotated[str, Field(description="HPC 服务 URL，可从 submit_job 返回的集群信息中获取")] = None,
+    token: Annotated[Optional[str], Field(description="token（可从 submit_job 返回的 token 字段获取")] = None,
+    hpcUrls: Annotated[Optional[str], Field(description="hpcUrls（可从 submit_job 返回的 hpcUrls 字段获取")] = None,
 ) -> dict:
     username = get_current_username()
 
     # 1. Auth check
     conn = get_db()
     try:
-        row = conn.execute(
+        user_row = conn.execute(
             "SELECT acToken FROM users WHERE userName = ?", (username,)
         ).fetchone()
     finally:
         conn.close()
 
-    if row is None or row["acToken"] is None:
+    if user_row is None or user_row["acToken"] is None:
         return {
             "error": True,
             "message": (
@@ -1080,11 +1080,11 @@ async def get_running_job_detail(
             "auth_url": f"/auth/{username}",
         }
 
-    # 2. Get hpcUrls from user_cluster
+    # 2. Get cluster token + hpcUrls from user_cluster
     conn = get_db()
     try:
         row = conn.execute(
-            "SELECT cu.hpcUrls "
+            "SELECT uc.token, cu.hpcUrls "
             "FROM user_cluster uc "
             "LEFT JOIN cluster_url cu ON uc.clusterId = cu.clusterId "
             "WHERE uc.userName = ?",
@@ -1093,7 +1093,26 @@ async def get_running_job_detail(
     finally:
         conn.close()
 
-    if row is None or not row["hpcUrls"]:
+    # Fallback: get token from database if not provided
+    if token is None:
+        if row is None or row["token"] is None:
+            return {
+                "error": True,
+                "message": (
+                    "未查询到集群认证凭证 token。"
+                    "请先调用 list_available_partitions 获取可用队列。"
+                ),
+            }
+        token = row["token"]
+
+    # Fallback: get hpcUrls from database if not provided
+    hpc_urls = None
+    if hpcUrls:
+        hpc_urls = hpcUrls
+    elif row and row["hpcUrls"]:
+        hpc_urls = row["hpcUrls"]
+
+    if not hpc_urls:
         return {
             "error": True,
             "message": (
@@ -1101,8 +1120,6 @@ async def get_running_job_detail(
                 "请先调用 list_available_partitions 获取可用队列。"
             ),
         }
-
-    hpc_urls = hpcUrls or row["hpcUrls"]
 
     # 3. Pick a random base URL and query job detail
     base_url = random.choice(hpc_urls.split(",")).strip().rstrip("/")
