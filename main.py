@@ -1316,7 +1316,7 @@ async def get_running_job_detail(
         }
 
     # 4. Auto-register document in APIs table
-    returns_schema = _build_return_schema(result)
+    returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
         "url": "{hpcUrls}/hpc/openapi/v2/jobs/{jobId}",
         "method": "GET",
