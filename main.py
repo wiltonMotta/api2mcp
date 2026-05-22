@@ -937,9 +937,9 @@ async def submit_job(
             }
 
     # 1. Auth check
-    auth_err = check_auth(username)
-    if auth_err:
-        return auth_err
+    auth_result = check_auth(username)
+    if isinstance(auth_result, dict):
+        return auth_result
 
     # 2. Get cluster token + hpcUrls from user_cluster + cluster_url
     conn = get_db()
@@ -1190,9 +1190,9 @@ async def get_running_job_detail(
     username = get_current_username()
 
     # 1. Auth check
-    auth_err = check_auth(username)
-    if auth_err:
-        return auth_err
+    auth_result = check_auth(username)
+    if isinstance(auth_result, dict):
+        return auth_result
 
     # 2. Resolve token and hpcUrls
     #   Priority: explicit args > DB (with optional clusterId match)
@@ -1376,9 +1376,9 @@ async def get_history_job_detail(
     username = get_current_username()
 
     # 1. Auth check
-    auth_err = check_auth(username)
-    if auth_err:
-        return auth_err
+    auth_result = check_auth(username)
+    if isinstance(auth_result, dict):
+        return auth_result
 
     # 2. Resolve token from explicit param > DB
     effective_token = token
