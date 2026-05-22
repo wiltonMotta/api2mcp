@@ -550,7 +550,7 @@ async def auth_submit(request: Request) -> HTMLResponse:
     finally:
         conn.close()
 
-    if user_row is None or user_row["acToken"] is None:
+    if user_row is None:
         return HTMLResponse(
             ERROR_PAGE_HTML.format(
                 username=safe_username,
