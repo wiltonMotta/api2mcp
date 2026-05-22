@@ -215,8 +215,9 @@ def get_current_username() -> str:
 
 
 def hmac_sha256_sign(secret_key: str, payload: dict) -> str:
+    """Compute HMAC-SHA256 signature using modern hmac.HMAC API."""
     sorted_json = json.dumps(payload, separators=(",", ":"), sort_keys=True)
-    return hmac.new(
+    return hmac.HMAC(
         secret_key.encode("utf-8"),
         sorted_json.encode("utf-8"),
         hashlib.sha256,
