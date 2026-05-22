@@ -791,8 +791,8 @@ async def list_available_partitions() -> list[dict]:
         if not valid_urls:
             continue
 
-        # P1-3: Round-robin via index counter
-        _url_idx = getattr(_url_idx_ctx, str(cid), 0)
+        # Round-robin via index counter
+        _url_idx = _url_idx_ctx.get(str(cid), 0)
         base_url = valid_urls[_url_idx % len(valid_urls)]
         _url_idx_ctx[str(cid)] = _url_idx + 1
 
