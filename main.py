@@ -1042,9 +1042,10 @@ async def submit_job(
     finally:
         conn.close()
 
-    # 返回结果中加入 token
+    # 返回结果中加入 token 和 hpcUrls
     if isinstance(result, dict):
         result["token"] = token
+        result["hpcUrls"] = hpc_urls
 
     return result
 
