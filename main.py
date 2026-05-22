@@ -1200,7 +1200,15 @@ async def get_running_job_detail(
         finally:
             conn.close()
 
-        if row is None or (row["token"] is None and effective_token is None):
+        if row is None:
+            return {
+                "error": True,
+                "message": (
+                    f"未在集群 clusterId={clusterId} 中找到您的认证凭证。"
+                    "请先调用 list_available_partitions 获取可用队列。"
+                ),
+            }
+        if row["token"] is None and effective_token is None:
             return {
                 "error": True,
                 "message": (
