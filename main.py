@@ -644,48 +644,23 @@ def _build_return_schema(data: Any) -> dict | None:
     """Build a returns.schema dict from sample data keys.
 
     Handles nested dicts/lists and provides a default schema for empty data.
+    Internal helper keys (_sub_schema, _element_type) are stripped from the
+    returned dict so they don't leak into the MCP client schema.
     """
     schema: dict = {}
     if isinstance(data, dict):
         for key, value in data.items():
             if isinstance(value, dict):
-                # For nested objects, infer the type of each sub-key
-                sub_schema: dict = {}
-                for sub_key, sub_val in value.items():
-                    sub_type = "any"
-                    if isinstance(sub_val, dict):
-                        sub_type = "object"
-                    elif isinstance(sub_val, list):
-                        sub_type = "array"
-                    else:
-                        sub_type = _infer_type(sub_val)
-                    sub_schema[sub_key] = {
-                        "type": sub_type,
-                        "description": sub_key,
-                        "optional": True,
-                    }
                 schema[key] = {
                     "type": "object",
                     "description": key,
                     "optional": True,
-                    "_sub_schema": sub_schema,
                 }
             elif isinstance(value, list):
-                # For arrays, inspect the first element if available
-                elem_type = "any"
-                if value:
-                    first = value[0]
-                    if isinstance(first, dict):
-                        elem_type = "object"
-                    elif isinstance(first, list):
-                        elem_type = "array"
-                    else:
-                        elem_type = _infer_type(first)
                 schema[key] = {
                     "type": "array",
                     "description": key,
                     "optional": True,
-                    "_element_type": elem_type,
                 }
             else:
                 schema[key] = {
@@ -693,6 +668,10 @@ def _build_return_schema(data: Any) -> dict | None:
                     "description": key,
                     "optional": True,
                 }
+    # Strip internal helper keys in case they leaked in
+    for v in schema.values():
+        v.pop("_sub_schema", None)
+        v.pop("_element_type", None)
     return schema if schema else {
         "status": {"type": "string", "description": "Response status", "optional": False},
     }
