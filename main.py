@@ -217,11 +217,12 @@ def migrate_db() -> None:
 AUTH_BASE_URL = "https://c-2056205187675406338.qdai.scnet.cn:58043"
 
 
-def check_auth(username: str) -> dict | None:
+def check_auth(username: str) -> sqlite3.Row | dict:
     """Check whether a user is authenticated.
 
-    Returns ``None`` if authenticated, otherwise returns an error ``dict``
-    with ``error=True``, ``message``, and ``auth_url`` fields.
+    Returns the database ``Row`` on success (with a valid ``acToken``),
+    or an error ``dict`` with ``error=True``, ``message``, and
+    ``auth_url`` fields when not authenticated.
     """
     conn = get_db()
     try:
@@ -240,7 +241,7 @@ def check_auth(username: str) -> dict | None:
             ),
             "auth_url": f"{AUTH_BASE_URL}/auth/{username}",
         }
-    return None
+    return row
 
 
 def get_current_username() -> str:
@@ -701,19 +702,11 @@ def _build_return_schema(data: Any) -> dict | None:
 async def get_user_info() -> dict:
     username = get_current_username()
 
-    auth_err = check_auth(username)
-    if auth_err:
-        return auth_err
+    auth_result = check_auth(username)
+    if isinstance(auth_result, dict):
+        return auth_result
 
-    conn = get_db()
-    try:
-        row = conn.execute(
-            "SELECT acToken FROM users WHERE userName = ?", (username,)
-        ).fetchone()
-    finally:
-        conn.close()
-
-    token = row["acToken"]
+    token = auth_result["acToken"]
 
     # P1-2: Use shared client
     client = _get_http_client(timeout=30.0)
@@ -762,7 +755,7 @@ async def list_available_partitions() -> list[dict]:
     username = get_current_username()
 
     auth_err = check_auth(username)
-    if auth_err:
+    if isinstance(auth_err, dict):
         return [auth_err]
 
     # Get all clusters for this user with their URLs
