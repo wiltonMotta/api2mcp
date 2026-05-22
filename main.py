@@ -1370,7 +1370,7 @@ async def get_running_job_detail(
 @mcp.tool()
 async def get_history_job_detail(
     jobId: Annotated[str, Field(description="作业 ID，可从 submit_job 返回的 jobID 字段获取")],
-    jobmanagerId: Annotated[str, Field(description="调度器 ID（可从 list_available_partitions 返回结果中获取")],
+    jobmanagerId: Annotated[str, Field(description="调度器 ID（可从 list_available_partitions 返回结果中获取）")],
     acctTime: Annotated[Optional[str], Field(description="入账时间（结束时间），建议传入以提升查询性能，格式 YYYY-MM-DD HH:MM:SS")] = None,
     token: Annotated[Optional[str], Field(description="可选：集群 token（可从 submit_job 返回的 token 字段获取）。如果省略，后端从数据库自动获取。")] = None,
 ) -> dict:
