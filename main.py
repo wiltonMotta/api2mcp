@@ -1389,6 +1389,179 @@ async def get_running_job_detail(
     return result
 
 
+@mcp.tool()
+async def get_history_job_detail(
+    jobId: Annotated[str, Field(description="作业 ID，可从 submit_job 返回的 jobID 字段获取")],
+    jobmanagerId: Annotated[str, Field(description="调度器 ID（可从 list_available_partitions 返回结果中获取")],
+    acctTime: Annotated[Optional[str], Field(description="入账时间（结束时间），建议传入以提升查询性能，格式 YYYY-MM-DD HH:MM:SS")] = None,
+    token: Annotated[Optional[str], Field(description="可选：集群 token（可从 submit_job 返回的 token 字段获取）。如果省略，后端从数据库自动获取。")] = None,
+) -> dict:
+    username = get_current_username()
+
+    # 1. Auth check
+    conn = get_db()
+    try:
+        user_row = conn.execute(
+            "SELECT acToken FROM users WHERE userName = ?", (username,)
+        ).fetchone()
+    finally:
+        conn.close()
+
+    if user_row is None or user_row["acToken"] is None:
+        return {
+            "error": True,
+            "message": (
+                f"用户 '{username}' 未认证。"
+                "请先访问认证页面获取访问凭证。"
+            ),
+            "auth_url": f"/auth/{username}",
+        }
+
+    # 2. Resolve token from explicit param > DB
+    effective_token = token
+    if effective_token is None:
+        conn = get_db()
+        try:
+            row = conn.execute(
+                "SELECT uc.token "
+                "FROM user_cluster uc "
+                "WHERE uc.userName = ?",
+                (username,),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        if row is None or row["token"] is None:
+            return {
+                "error": True,
+                "message": (
+                    "未查询到集群认证凭证 token。"
+                    "请先调用 list_available_partitions 获取可用队列。"
+                ),
+            }
+        effective_token = row["token"]
+
+    # 3. Get hpcUrls from DB
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT cu.hpcUrls "
+            "FROM user_cluster uc "
+            "LEFT JOIN cluster_url cu ON uc.clusterId = cu.clusterId "
+            "WHERE uc.userName = ?",
+            (username,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+    if row is None or not row["hpcUrls"]:
+        return {
+            "error": True,
+            "message": (
+                "未查询到集群 HPC 服务 URL。"
+                "请先调用 list_available_partitions 获取可用队列。"
+            ),
+        }
+    hpc_urls = row["hpcUrls"]
+
+    # 4. Query — try each cluster URL in turn
+    base_urls = [u.strip().rstrip("/") for u in hpc_urls.split(",") if u.strip()]
+    if not base_urls:
+        return {
+            "error": True,
+            "message": "未找到有效的 HPC 服务 URL。",
+        }
+
+    last_err: Exception | None = None
+    result: dict | None = None
+    client = _get_http_client(timeout=30.0)
+
+    # Build query params — only include if provided
+    query_params: dict[str, Any] | None = None
+    if acctTime:
+        query_params = {"acctTime": acctTime}
+
+    for base_url in base_urls:
+        history_job_url = (
+            f"{base_url}/hpc/openapi/v2/historyjobs/{jobmanagerId}/{jobId}"
+        )
+        try:
+            resp = await client.get(
+                history_job_url,
+                headers={"token": effective_token, "Content-Type": "application/json"},
+                params=query_params,
+            )
+            resp.raise_for_status()
+            result = resp.json()
+            break
+        except httpx.HTTPStatusError as exc:
+            last_err = exc
+            continue
+        except Exception as exc:
+            last_err = exc
+            continue
+    else:
+        if isinstance(last_err, httpx.HTTPStatusError):
+            error_text = last_err.response.text[:500]
+            return {
+                "error": True,
+                "message": (
+                    f"查询历史作业 {jobId} 失败 (HTTP {last_err.response.status_code})。"
+                    f"详情: {error_text}"
+                ),
+                "status_code": last_err.response.status_code,
+            }
+        return {
+            "error": True,
+            "message": f"查询历史作业请求异常: {last_err}",
+        }
+
+    # 5. Auto-register document in APIs table
+    returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
+    doc = {
+        "url": "{hpcUrls}/hpc/openapi/v2/historyjobs/{jobmanagerId}/{jobId}",
+        "method": "GET",
+        "description": (
+            "查询 HPC 集群中指定历史作业（已完成/已终止）的详细信息。"
+            "调用前需先通过 list_available_partitions 获取可用队列信息和 jobManagerID，"
+            "并从提交结果中获取 jobId。后端会自动处理认证和集群信息。"
+        ),
+        "parameters": {
+            "format": "URLParameter",
+            "schema": {
+                "jobId": {"type": "string", "description": "作业 ID，可从 submit_job 返回的 jobID 字段获取", "optional": False},
+                "jobmanagerId": {"type": "string", "description": "调度器 ID，可从 list_available_partitions 返回结果中获取", "optional": False},
+                "acctTime": {"type": "string", "description": "入账时间（结束时间），建议传入以提升查询性能，格式 YYYY-MM-DD HH:MM:SS", "optional": True},
+                "token": {"type": "string", "description": "可选：token，可从 submit_job 返回的 token 字段获取", "optional": True},
+            },
+        },
+        "returns": {
+            "format": "JSON",
+            "schema": returns_schema or {
+                "jobId": {"type": "string", "description": "作业 ID", "optional": False},
+                "jobName": {"type": "string", "description": "作业名称", "optional": False},
+                "jobState": {"type": "string", "description": "作业状态", "optional": False},
+                "jobStartTime": {"type": "string", "description": "开始时间", "optional": False},
+                "jobEndTime": {"type": "string", "description": "结束时间", "optional": False},
+                "jobMemUsed": {"type": "number", "description": "已用内存(MB)", "optional": True},
+                "jobCpuTime": {"type": "number", "description": "CPU时间(秒)", "optional": True},
+                "jobExecHost": {"type": "string", "description": "执行节点", "optional": True},
+            },
+        },
+    }
+    conn = get_db()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO APIs(name, document) VALUES (?, ?)",
+            ("get_history_job_detail", json.dumps(doc, ensure_ascii=False)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
