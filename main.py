@@ -619,14 +619,50 @@ def _build_return_schema(data: Any) -> dict | None:
     if isinstance(data, dict):
         for key, value in data.items():
             if isinstance(value, dict):
-                value = "<object>"
+                # For nested objects, infer the type of each sub-key
+                sub_schema: dict = {}
+                for sub_key, sub_val in value.items():
+                    sub_type = "any"
+                    if isinstance(sub_val, dict):
+                        sub_type = "object"
+                    elif isinstance(sub_val, list):
+                        sub_type = "array"
+                    else:
+                        sub_type = _infer_type(sub_val)
+                    sub_schema[sub_key] = {
+                        "type": sub_type,
+                        "description": sub_key,
+                        "optional": True,
+                    }
+                schema[key] = {
+                    "type": "object",
+                    "description": key,
+                    "optional": True,
+                    "_sub_schema": sub_schema,
+                }
             elif isinstance(value, list):
-                value = "<array>"
-            schema[key] = {
-                "type": _infer_type(value),
-                "description": key,
-                "optional": True,
-            }
+                # For arrays, inspect the first element if available
+                elem_type = "any"
+                if value:
+                    first = value[0]
+                    if isinstance(first, dict):
+                        elem_type = "object"
+                    elif isinstance(first, list):
+                        elem_type = "array"
+                    else:
+                        elem_type = _infer_type(first)
+                schema[key] = {
+                    "type": "array",
+                    "description": key,
+                    "optional": True,
+                    "_element_type": elem_type,
+                }
+            else:
+                schema[key] = {
+                    "type": _infer_type(value),
+                    "description": key,
+                    "optional": True,
+                }
     return schema if schema else {
         "status": {"type": "string", "description": "Response status", "optional": False},
     }
