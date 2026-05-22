@@ -19,19 +19,21 @@
 | 参数名 | 类型 | 必填 | 默认值 / 来源说明 |
 |--------|------|------|-------------------|
 | `jobId` | string | 是 | 作业 ID（可从 `submit_job` 返回的 `jobID` 字段获取） |
-| `token` | string | 否 | token（可从 `submit_job` 返回的 `token` 字段获取） |
-| `hpcUrls` | string | 否 | hpcUrls（可从 `submit_job` 返回的 `hpcUrls` 字段获取） |
+| `clusterId` | integer | 否 | 可选：集群 ID。精确匹配可减少查询失败概率。如果省略，后端会自动遍历用户有权限的所有集群尝试查询。 |
+| `token` | string | 否 | 可选：集群 token（可从 `submit_job` 返回的 `token` 字段获取）。如果省略，后端从数据库自动获取。 |
+| `hpcUrls` | string | 否 | 可选：集群 hpcUrls（可从 `submit_job` 返回的 `hpcUrls` 字段获取）。如果省略，后端从数据库自动获取。 |
 
 ## 后端处理逻辑
 
-1. **认证校验**：检查选定集群的 token 是否存在
-2.  **调用 API**：GET `{base_url}/hpc/openapi/v2/jobs/{jobId}`，header 带 `token` 和 `Content-Type: application/json`
-3. **返回结果**：直接返回 API 响应的 JSON 数据
+1. **认证校验**：检查 `users` 表中是否有 `acToken`
+2. **解析 token/hpcUrls**：优先级为 `显式参数 > 数据库`。如果提供了 `clusterId`，则精确查询该集群；否则遍历用户所有集群，取第一个有效的 token+hpcUrls 组合
+3. **遍历查询**：按顺序遍历 `hpcUrls` 中的每个 URL，尝试查询作业详情，成功即返回
+4. **返回结果**：直接返回 API 响应的 JSON 数据
 
 ## API 调用
 
-- URL: `{hpcUrls}/hpc/openapi/v2/jobs/{jobId}`
-  - `{hpcUrls}` 为从 `cluster_url` 表中获取的集群 URL（随机选取）
+- URL: `{base_url}/hpc/openapi/v2/jobs/{jobId}`
+  - `{base_url}` 为从 `hpcUrls`（逗号分隔）中依次选取的 URL
   - `{jobId}` 为用户传入的作业 ID
 - Method: GET
 - Headers: `{"token": token, "Content-Type": "application/json"}`
@@ -40,10 +42,10 @@
 
 ## 异常处理
 
-- **无可用集群**： `user_cluster` 中无对应 `clusterId` 的 token，返回错误提示，说明无法查询作业
-- **集群无 URL**：若从 `cluster_url` 表中获取 `hpcUrls` 失败，返回适当提示
+- **无可用集群**：`user_cluster` 中无任何集群的 token 或 hpcUrls，返回错误提示
+- **集群无 URL**：若 `hpcUrls` 解析后为空列表，返回错误提示
+- **所有 URL 查询失败**：遍历完所有 `hpcUrls` 后仍失败，返回最后一个失败的 HTTP 错误详情
 - **作业不存在/无权限**：API 返回错误时，返回易于理解的中文提示信息
-- **其他错误**：捕获 HTTP 异常或 API 返回的错误码，返回易于理解的中文提示信息
 
 ## 返回值
 
