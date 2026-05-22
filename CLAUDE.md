@@ -29,6 +29,10 @@ python example_client.py --stdio
 
 # Manage server process (stop + restart)
 bash restartMcp.sh  # 重启服务，端口 8002
+
+# Auto-monitor: 代码变更后自动 git commit + 重启服务
+python auto_commit_restart.py  # 前台运行，Ctrl+C 退出
+nohup python auto_commit_restart.py > /tmp/api2mcp/auto_commit.log 2>&1 &  # 后台运行
 ```
 
 Set `MCP_DB_PATH` to override the default SQLite database path (`apis.db`).

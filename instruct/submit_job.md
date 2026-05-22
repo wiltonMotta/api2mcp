@@ -109,7 +109,7 @@ Body:
 ## 返回值
 
 - 直接返回 API 响应的 JSON 数据（通常包含 `jobID`、`status` 等字段）
-- 将入参的token加入到返回值中
+- 将入参的token和hpcUrls加入到返回值中
 
 ## 自动注册
 
