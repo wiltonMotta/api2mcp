@@ -95,6 +95,8 @@ AUTH_PAGE_HTML = """\
   button:hover {{ background: #1d4ed8; }}
   .info {{ font-size: 13px; color: #6b7280; margin-bottom: 20px; line-height: 1.5; }}
   .error {{ color: #dc2626; font-size: 14px; margin-top: 12px; }}
+  .btn-link {{ display: inline-block; width: 100%; padding: 11px; background: #f3f4f6; color: #374151; border: 1px solid #d1d5db; border-radius: 6px; font-size: 14px; font-weight: 500; text-align: center; text-decoration: none; cursor: pointer; margin-top: 8px; }}
+  .btn-link:hover {{ background: #e5e7eb; }}
 </style>
 </head>
 <body>
