@@ -656,10 +656,22 @@ async def get_user_info() -> dict:
 
     token = row["acToken"]
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    # P1-2: Use shared client
+    client = _get_http_client(timeout=30.0)
+    try:
         resp = await client.get(SCNET_USER_URL, headers={"token": token})
         resp.raise_for_status()
         data = resp.json()
+    except httpx.HTTPStatusError as exc:
+        return {
+            "error": True,
+            "message": f"SCNet API 错误 (HTTP {exc.response.status_code}): {exc.response.text[:300]}",
+        }
+    except Exception as exc:
+        return {
+            "error": True,
+            "message": f"请求异常: {exc}",
+        }
 
     # Auto-generate document and store in APIs table
     doc = {
