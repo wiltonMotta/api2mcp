@@ -1056,8 +1056,9 @@ async def submit_job(
 @mcp.tool()
 async def get_running_job_detail(
     jobId: Annotated[str, Field(description="作业 ID，可从 submit_job 返回的 jobID 字段获取")],
-    token: Annotated[Optional[str], Field(description="token（可从 submit_job 返回的 token 字段获取")] = None,
-    hpcUrls: Annotated[Optional[str], Field(description="hpcUrls（可从 submit_job 返回的 hpcUrls 字段获取")] = None,
+    clusterId: Annotated[Optional[int], Field(description="可选：集群 ID。精确匹配可减少查询失败概率。如果省略，后端会自动遍历用户有权限的所有集群尝试查询。")] = None,
+    token: Annotated[Optional[str], Field(description="可选：集群 token（可从 submit_job 返回的 token 字段获取）。如果省略，后端从数据库自动获取。")] = None,
+    hpcUrls: Annotated[Optional[str], Field(description="可选：集群 hpcUrls（可从 submit_job 返回的 hpcUrls 字段获取）。如果省略，后端从数据库自动获取。")] = None,
 ) -> dict:
     username = get_current_username()
 
@@ -1080,73 +1081,138 @@ async def get_running_job_detail(
             "auth_url": f"/auth/{username}",
         }
 
-    # 2. Get cluster token + hpcUrls from user_cluster
-    conn = get_db()
-    try:
-        row = conn.execute(
-            "SELECT uc.token, cu.hpcUrls "
-            "FROM user_cluster uc "
-            "LEFT JOIN cluster_url cu ON uc.clusterId = cu.clusterId "
-            "WHERE uc.userName = ?",
-            (username,),
-        ).fetchone()
-    finally:
-        conn.close()
+    # 2. Resolve token and hpcUrls
+    #   Priority: explicit args > DB (with optional clusterId match)
+    effective_token = token
+    effective_hpc_urls = hpcUrls
 
-    # Fallback: get token from database if not provided
-    if token is None:
-        if row is None or row["token"] is None:
+    if clusterId is not None:
+        # Precise match: look up the specified cluster
+        conn = get_db()
+        try:
+            row = conn.execute(
+                "SELECT uc.token, cu.hpcUrls "
+                "FROM user_cluster uc "
+                "LEFT JOIN cluster_url cu ON uc.clusterId = cu.clusterId "
+                "WHERE uc.userName = ? AND uc.clusterId = ?",
+                (username, clusterId),
+            ).fetchone()
+        finally:
+            conn.close()
+
+        if row is None or (row["token"] is None and effective_token is None):
             return {
                 "error": True,
                 "message": (
-                    "未查询到集群认证凭证 token。"
+                    f"未在集群 clusterId={clusterId} 中找到您的认证凭证。"
                     "请先调用 list_available_partitions 获取可用队列。"
                 ),
             }
-        token = row["token"]
+        if row["hpcUrls"] is None and effective_hpc_urls is None:
+            return {
+                "error": True,
+                "message": (
+                    f"集群 {row.get('clusterName', clusterId)} 未配置 HPC 服务 URL。"
+                    "请联系管理员配置集群信息。"
+                ),
+            }
 
-    # Fallback: get hpcUrls from database if not provided
-    hpc_urls = None
-    if hpcUrls:
-        hpc_urls = hpcUrls
-    elif row and row["hpcUrls"]:
-        hpc_urls = row["hpcUrls"]
+        if effective_token is None:
+            effective_token = row["token"]
+        if effective_hpc_urls is None:
+            effective_hpc_urls = row["hpcUrls"]
+    else:
+        # Fallback: fetch all clusters for this user
+        conn = get_db()
+        try:
+            rows = conn.execute(
+                "SELECT uc.clusterId, uc.token, cu.hpcUrls "
+                "FROM user_cluster uc "
+                "LEFT JOIN cluster_url cu ON uc.clusterId = cu.clusterId "
+                "WHERE uc.userName = ?",
+                (username,),
+            ).fetchall()
+        finally:
+            conn.close()
 
-    if not hpc_urls:
+        if not rows:
+            return {
+                "error": True,
+                "message": (
+                    "未查询到任何集群的认证凭证 token。"
+                    "请先调用 list_available_partitions 获取可用队列。"
+                ),
+            }
+
+        if effective_token is None and effective_hpc_urls is None:
+            # Use the first valid cluster as default
+            for r in rows:
+                if r["token"] and r["hpcUrls"]:
+                    effective_token = r["token"]
+                    effective_hpc_urls = r["hpcUrls"]
+                    break
+            else:
+                return {
+                    "error": True,
+                    "message": (
+                        "所有集群均缺少有效的 token 或 hpcUrls。"
+                        "请先调用 list_available_partitions。"
+                    ),
+                }
+        elif effective_token is None:
+            for r in rows:
+                if r["token"]:
+                    effective_token = r["token"]
+                    break
+        elif effective_hpc_urls is None:
+            for r in rows:
+                if r["hpcUrls"]:
+                    effective_hpc_urls = r["hpcUrls"]
+                    break
+
+    # 3. Query job detail — try each cluster URL in turn
+    base_urls = [u.strip().rstrip("/") for u in effective_hpc_urls.split(",") if u.strip()]
+    if not base_urls:
         return {
             "error": True,
-            "message": (
-                "未查询到集群 HPC 服务 URL。"
-                "请先调用 list_available_partitions 获取可用队列。"
-            ),
+            "message": "未找到有效的 HPC 服务 URL。",
         }
 
-    # 3. Pick a random base URL and query job detail
-    base_url = random.choice(hpc_urls.split(",")).strip().rstrip("/")
-    job_detail_url = f"{base_url}/hpc/openapi/v2/jobs/{jobId}"
-
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.get(
-                job_detail_url,
-                headers={"token": token, "Content-Type": "application/json"},
-            )
-            resp.raise_for_status()
-            result = resp.json()
-    except httpx.HTTPStatusError as exc:
-        error_text = exc.response.text[:500]
+    last_err: Exception | None = None
+    for base_url in base_urls:
+        job_detail_url = f"{base_url}/hpc/openapi/v2/jobs/{jobId}"
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.get(
+                    job_detail_url,
+                    headers={"token": effective_token, "Content-Type": "application/json"},
+                )
+                resp.raise_for_status()
+                result = resp.json()
+            # Success — break out and return
+            break
+        except httpx.HTTPStatusError as exc:
+            last_err = exc
+            # Try next URL
+            continue
+        except Exception as exc:
+            last_err = exc
+            continue
+    else:
+        # All URLs failed
+        if isinstance(last_err, httpx.HTTPStatusError):
+            error_text = last_err.response.text[:500]
+            return {
+                "error": True,
+                "message": (
+                    f"查询作业 {jobId} 失败 (HTTP {last_err.response.status_code})。"
+                    f"详情: {error_text}"
+                ),
+                "status_code": last_err.response.status_code,
+            }
         return {
             "error": True,
-            "message": (
-                f"查询作业 {jobId} 失败 (HTTP {exc.response.status_code})。"
-                f"详情: {error_text}"
-            ),
-            "status_code": exc.response.status_code,
-        }
-    except Exception as exc:
-        return {
-            "error": True,
-            "message": f"查询作业请求异常: {exc}",
+            "message": f"查询作业请求异常: {last_err}",
         }
 
     # 4. Auto-register document in APIs table
@@ -1162,8 +1228,9 @@ async def get_running_job_detail(
             "format": "URLParameter",
             "schema": {
                 "jobId": {"type": "string", "description": "作业 ID，可从 submit_job 返回的 jobID 字段获取", "optional": False},
-                "token": {"type": "string", "description": "token，可从 submit_job 返回的 token 字段获取", "optional": True},
-                "hpcUrls": {"type": "string", "description": "hpcUrls，可从 submit_job 返回的 hpcUrls 字段获取", "optional": True},
+                "clusterId": {"type": "integer", "description": "可选：集群 ID，用于精确匹配", "optional": True},
+                "token": {"type": "string", "description": "可选：token，可从 submit_job 返回的 token 字段获取", "optional": True},
+                "hpcUrls": {"type": "string", "description": "可选：hpcUrls，可从 submit_job 返回的 hpcUrls 字段获取", "optional": True},
             },
         },
         "returns": {
