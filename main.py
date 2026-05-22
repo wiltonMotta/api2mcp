@@ -424,8 +424,7 @@ async def auth_submit(request: Request) -> HTMLResponse:
 
     client = _get_http_client(timeout=30.0)
     try:
-        try:
-            resp = await client.post(SCNET_TOKEN_URL, headers=headers, json={})
+        resp = await client.post(SCNET_TOKEN_URL, headers=headers, json={})
             resp.raise_for_status()
             token_data = resp.json()
 
