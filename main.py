@@ -761,24 +761,13 @@ async def get_user_info() -> dict:
 async def list_available_partitions() -> list[dict]:
     username = get_current_username()
 
+    auth_err = check_auth(username)
+    if auth_err:
+        return [auth_err]
+
+    # Get all clusters for this user with their URLs
     conn = get_db()
     try:
-        # Check auth
-        user_row = conn.execute(
-            "SELECT acToken FROM users WHERE userName = ?", (username,)
-        ).fetchone()
-
-        if user_row is None or user_row["acToken"] is None:
-            return [{
-                "error": True,
-                "message": (
-                    f"User '{username}' is not authenticated. "
-                    "Please visit the authentication page to obtain access credentials."
-                ),
-                "auth_url": f"/auth/{username}",
-            }]
-
-        # Get all clusters for this user with their URLs
         clusters = conn.execute(
             "SELECT uc.clusterId, uc.clusterName, uc.token, "
             "cu.hpcUrls "
