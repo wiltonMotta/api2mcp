@@ -971,19 +971,24 @@ async def submit_job(
     job_manager_id = None
 
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            ci_resp = await client.get(
-                f"{base_url}/hpc/openapi/v2/cluster",
-                headers={"token": token, "Content-Type": "application/json"},
-            )
-            ci_resp.raise_for_status()
-            ci_data = ci_resp.json()
+        client = _get_http_client(timeout=30.0)
+        ci_resp = await client.get(
+            f"{base_url}/hpc/openapi/v2/cluster",
+            headers={"token": token, "Content-Type": "application/json"},
+        )
+        ci_resp.raise_for_status()
+        ci_data = ci_resp.json()
+
+        if not isinstance(ci_data, dict):
+            raise ValueError("Unexpected cluster API response format")
 
         cluster_list = ci_data.get("data", ci_data)
         if isinstance(cluster_list, list) and cluster_list:
             job_manager_id = str(cluster_list[0].get("id", ""))
         elif isinstance(cluster_list, dict):
             job_manager_id = str(cluster_list.get("id", ""))
+        else:
+            job_manager_id = ""
     except Exception:
         return {
             "error": True,
@@ -1066,14 +1071,14 @@ async def submit_job(
     submit_url = f"{base_url}/hpc/openapi/v2/apptemplates/BASIC/{appname}/job"
 
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(
-                submit_url,
-                headers={"token": token, "Content-Type": "application/json"},
-                json=request_body,
-            )
-            resp.raise_for_status()
-            result = resp.json()
+        client = _get_http_client(timeout=30.0)
+        resp = await client.post(
+            submit_url,
+            headers={"token": token, "Content-Type": "application/json"},
+            json=request_body,
+        )
+        resp.raise_for_status()
+        result = resp.json()
     except httpx.HTTPStatusError as exc:
         error_text = exc.response.text[:500]
         try:
