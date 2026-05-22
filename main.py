@@ -1566,10 +1566,64 @@ async def get_history_job_detail(
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _register_history_job_detail_doc() -> None:
+    """注册 get_history_job_detail 的文档到 APIs 表（启动时执行）。"""
+    doc = {
+        "url": "{hpcUrls}/hpc/openapi/v2/historyjobs/{jobmanagerId}/{jobId}",
+        "method": "GET",
+        "description": (
+            "查询 HPC 集群中指定历史作业（已完成/已终止）的详细信息。"
+            "调用前需先通过 list_available_partitions 获取可用队列信息和 jobManagerID，"
+            "并从提交结果中获取 jobId。后端会自动处理认证和集群信息。"
+        ),
+        "parameters": {
+            "format": "URLParameter",
+            "schema": {
+                "jobId": {"type": "string", "description": "作业 ID，可从 submit_job 返回的 jobID 字段获取", "optional": False},
+                "jobmanagerId": {"type": "string", "description": "调度器 ID，可从 list_available_partitions 返回结果中获取", "optional": False},
+                "acctTime": {"type": "string", "description": "入账时间（结束时间），建议传入以提升查询性能，格式 YYYY-MM-DD HH:MM:SS", "optional": True},
+                "token": {"type": "string", "description": "可选：token，可从 submit_job 返回的 token 字段获取", "optional": True},
+            },
+        },
+        "returns": {
+            "format": "JSON",
+            "schema": {
+                "acctTime": {"type": "string", "description": "入账时间", "optional": True},
+                "jobId": {"type": "string", "description": "作业 ID", "optional": False},
+                "jobmanagerId": {"type": "number", "description": "调度器 ID", "optional": False},
+                "jobmanagerName": {"type": "string", "description": "集群名称", "optional": True},
+                "userName": {"type": "string", "description": "用户名", "optional": True},
+                "jobName": {"type": "string", "description": "作业名称", "optional": True},
+                "queue": {"type": "string", "description": "队列名称", "optional": True},
+                "jobQueueTime": {"type": "string", "description": "排队开始时间", "optional": True},
+                "jobStartTime": {"type": "string", "description": "开始时间", "optional": False},
+                "jobEndTime": {"type": "string", "description": "结束时间", "optional": False},
+                "jobExitStatus": {"type": "number", "description": "退出状态码", "optional": True},
+                "jobCpuTime": {"type": "number", "description": "CPU时间(秒)", "optional": True},
+                "jobMemUsed": {"type": "number", "description": "已用内存(MB)", "optional": True},
+                "jobExecHost": {"type": "string", "description": "执行节点", "optional": True},
+                "jobState": {"type": "string", "description": "作业状态", "optional": True},
+            },
+        },
+    }
+    conn = get_db()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO APIs(name, document) VALUES (?, ?)",
+            ("get_history_job_detail", json.dumps(doc, ensure_ascii=False)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
 # Register existing DB proxy tools at import time
 _count = register_apis(mcp)
 if _count:
     print(f"[mcp] registered {_count} proxy API tool(s) from {DB_PATH}")
+
+# Pre-register built-in tool docs so they appear in tool list immediately
+_register_history_job_detail_doc()
+print("[mcp] pre-registered get_history_job_detail in APIs table")
 
 
 def main() -> None:
