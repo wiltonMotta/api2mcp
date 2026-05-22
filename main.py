@@ -944,23 +944,9 @@ async def submit_job(
             }
 
     # 1. Auth check
-    conn = get_db()
-    try:
-        user_row = conn.execute(
-            "SELECT acToken FROM users WHERE userName = ?", (username,)
-        ).fetchone()
-    finally:
-        conn.close()
-
-    if user_row is None or user_row["acToken"] is None:
-        return {
-            "error": True,
-            "message": (
-                f"用户 '{username}' 未认证。"
-                "请先访问认证页面获取访问凭证。"
-            ),
-            "auth_url": f"/auth/{username}",
-        }
+    auth_err = check_auth(username)
+    if auth_err:
+        return auth_err
 
     # 2. Get cluster token + hpcUrls from user_cluster + cluster_url
     conn = get_db()
@@ -1211,23 +1197,9 @@ async def get_running_job_detail(
     username = get_current_username()
 
     # 1. Auth check
-    conn = get_db()
-    try:
-        user_row = conn.execute(
-            "SELECT acToken FROM users WHERE userName = ?", (username,)
-        ).fetchone()
-    finally:
-        conn.close()
-
-    if user_row is None or user_row["acToken"] is None:
-        return {
-            "error": True,
-            "message": (
-                f"用户 '{username}' 未认证。"
-                "请先访问认证页面获取访问凭证。"
-            ),
-            "auth_url": f"/auth/{username}",
-        }
+    auth_err = check_auth(username)
+    if auth_err:
+        return auth_err
 
     # 2. Resolve token and hpcUrls
     #   Priority: explicit args > DB (with optional clusterId match)
@@ -1411,23 +1383,9 @@ async def get_history_job_detail(
     username = get_current_username()
 
     # 1. Auth check
-    conn = get_db()
-    try:
-        user_row = conn.execute(
-            "SELECT acToken FROM users WHERE userName = ?", (username,)
-        ).fetchone()
-    finally:
-        conn.close()
-
-    if user_row is None or user_row["acToken"] is None:
-        return {
-            "error": True,
-            "message": (
-                f"用户 '{username}' 未认证。"
-                "请先访问认证页面获取访问凭证。"
-            ),
-            "auth_url": f"/auth/{username}",
-        }
+    auth_err = check_auth(username)
+    if auth_err:
+        return auth_err
 
     # 2. Resolve token from explicit param > DB
     effective_token = token
