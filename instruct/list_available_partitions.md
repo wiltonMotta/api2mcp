@@ -22,7 +22,7 @@
 
 ### 2. 获取调度器 ID
 - 过滤空 URL 后，按轮询（round-robin）选取一个 URL 作为 base_url
-- GET `{base_url}/hpc/openapi/v2/cluster`，header 带 `token` 和 `Content-Type: `application/json`
+- GET `{base_url}/hpc/openapi/v2/cluster`，header 带 `token` 和 `Content-Type: application/json`
 - 先校验返回数据是否为 dict 类型，防止 API 返回异常格式导致崩溃
 - 从返回的 data（可能是 list 或 dict）中提取第一个集群的 `id` 作为 `jobManagerID`
 - 如果提取不到 jobManagerID → 静默跳过，不报错
