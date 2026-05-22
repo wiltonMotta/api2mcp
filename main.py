@@ -1162,7 +1162,8 @@ async def get_running_job_detail(
             "format": "URLParameter",
             "schema": {
                 "jobId": {"type": "string", "description": "作业 ID，可从 submit_job 返回的 jobID 字段获取", "optional": False},
-                "token": {"type": "string", "description": "token，可从 submit_job 返回的 token 字段获取", "optional": False},
+                "token": {"type": "string", "description": "token，可从 submit_job 返回的 token 字段获取", "optional": True},
+                "hpcUrls": {"type": "string", "description": "hpcUrls，可从 submit_job 返回的 hpcUrls 字段获取", "optional": True},
             },
         },
         "returns": {
