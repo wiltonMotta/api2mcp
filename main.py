@@ -530,7 +530,7 @@ async def auth_submit(request: Request) -> HTMLResponse:
                 )
             else:
                 conn.execute(
-                    "INSERT OR REPLACE INTO user_cluster"
+                    "INSERT OR REPLACE INTO user_cluster "
                     "(userName, clusterId, clusterName, token, created_at, updated_at) "
                     "VALUES (?, ?, ?, ?, ?, ?)",
                     (username, cid, cname, token, now, now),
