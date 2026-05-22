@@ -1280,21 +1280,20 @@ async def get_running_job_detail(
         }
 
     last_err: Exception | None = None
+    result: dict | None = None
+    client = _get_http_client(timeout=30.0)
     for base_url in base_urls:
         job_detail_url = f"{base_url}/hpc/openapi/v2/jobs/{jobId}"
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.get(
-                    job_detail_url,
-                    headers={"token": effective_token, "Content-Type": "application/json"},
-                )
-                resp.raise_for_status()
-                result = resp.json()
-            # Success — break out and return
+            resp = await client.get(
+                job_detail_url,
+                headers={"token": effective_token, "Content-Type": "application/json"},
+            )
+            resp.raise_for_status()
+            result = resp.json()
             break
         except httpx.HTTPStatusError as exc:
             last_err = exc
-            # Try next URL
             continue
         except Exception as exc:
             last_err = exc
