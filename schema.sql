@@ -20,13 +20,18 @@ CREATE TABLE IF NOT EXISTS users (
 
 -- Per-cluster tokens obtained during AK/SK authentication.
 CREATE TABLE IF NOT EXISTS user_cluster (
-    userName    TEXT,
-    clusterId   INTEGER,
-    clusterName TEXT,
-    homePath    TEXT,
-    token       TEXT NOT NULL,
-    created_at  datetime,
-    updated_at  datetime,
+    userName        TEXT,
+    clusterId       INTEGER,
+    clusterName     TEXT,
+    homePath        TEXT,
+    token           TEXT NOT NULL,
+    JobManagerType  TEXT,
+    JobManagerAddr  TEXT,
+    JobManagerid    TEXT,
+    JobManagertext  TEXT,
+    JobManagerPort  TEXT,
+    created_at      datetime,
+    updated_at      datetime,
     PRIMARY KEY (userName, clusterId)
 );
 

@@ -53,19 +53,25 @@ TYPE_MAP: dict[str, type] = {
 
 MIGRATION_SQL = """
 CREATE TABLE IF NOT EXISTS users (
-    userName   TEXT PRIMARY KEY,
+    userName   TEXT PRIMARY KEY,r
     acToken    TEXT,
     created_at datetime,
     updated_at datetime
 );
 CREATE TABLE IF NOT EXISTS user_cluster (
-    userName    TEXT,
-    clusterId   INTEGER,
-    clusterName TEXT,
-    homePath    TEXT,
-    token       TEXT NOT NULL,
-    created_at  datetime,
-    updated_at  datetime,
+    userName        TEXT,
+    clusterId       INTEGER,
+    clusterName     TEXT,
+    homePath        TEXT,
+    token           TEXT NOT NULL,
+    isDefault       boolean,
+    JobManagerType  TEXT,
+    JobManagerAddr  TEXT,
+    JobManagerid    TEXT,
+    JobManagertext  TEXT,
+    JobManagerPort  TEXT,
+    created_at      datetime,
+    updated_at      datetime,
     PRIMARY KEY (userName, clusterId)
 );
 CREATE TABLE IF NOT EXISTS cluster_url (
@@ -205,6 +211,18 @@ def migrate_db() -> None:
     conn = sqlite3.connect(DB_PATH)
     try:
         conn.executescript(MIGRATION_SQL)
+        # Add columns that may not exist in older databases
+        for col_sql in [
+            "ALTER TABLE user_cluster ADD COLUMN JobManagerType TEXT",
+            "ALTER TABLE user_cluster ADD COLUMN JobManagerAddr TEXT",
+            "ALTER TABLE user_cluster ADD COLUMN JobManagerid TEXT",
+            "ALTER TABLE user_cluster ADD COLUMN JobManagertext TEXT",
+            "ALTER TABLE user_cluster ADD COLUMN JobManagerPort TEXT",
+        ]:
+            try:
+                conn.execute(col_sql)
+            except sqlite3.OperationalError:
+                pass
         conn.commit()
     finally:
         conn.close()
@@ -531,9 +549,11 @@ async def auth_submit(request: Request) -> HTMLResponse:
             else:
                 conn.execute(
                     "INSERT OR REPLACE INTO user_cluster "
-                    "(userName, clusterId, clusterName, token, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (username, cid, cname, token, now, now),
+                    "(userName, clusterId, clusterName, token, "
+                    "JobManagerType, JobManagerAddr, JobManagerid, JobManagertext, JobManagerPort, "
+                    "created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (username, cid, cname, token, "", "", "", "", "", now, now),
                 )
                 other_clusters.append({"clusterId": cid, "clusterName": cname, "token": token})
 
@@ -592,12 +612,52 @@ async def auth_submit(request: Request) -> HTMLResponse:
         efile_urls = _join_urls(ci_payload.get("efileUrls")) if isinstance(ci_payload, dict) else ""
         eshell_urls = _join_urls(ci_payload.get("eshellUrls")) if isinstance(ci_payload, dict) else ""
 
+        # Call cluster API to get JobManager details from cluster_list
+        job_manager_type = ""
+        job_manager_addr = ""
+        job_manager_id_val = ""
+        job_manager_text = ""
+        job_manager_port = ""
+
+        if hpc_urls:
+            valid_hpc_urls = [u.strip().rstrip("/") for u in hpc_urls.split(",") if u.strip()]
+            if valid_hpc_urls:
+                try:
+                    cluster_client = _get_http_client(timeout=30.0)
+                    cluster_resp = await cluster_client.get(
+                        f"{valid_hpc_urls[0]}/hpc/openapi/v2/cluster",
+                        headers={"token": cl["token"], "Content-Type": "application/json"},
+                    )
+                    cluster_resp.raise_for_status()
+                    cluster_data = cluster_resp.json()
+
+                    if isinstance(cluster_data, dict):
+                        cluster_list = cluster_data.get("data", cluster_data)
+                        if isinstance(cluster_list, list) and cluster_list:
+                            first = cluster_list[0]
+                            job_manager_type = str(first.get("JobManagerType", ""))
+                            job_manager_addr = str(first.get("JobManagerAddr", ""))
+                            job_manager_id_val = str(first.get("id", ""))
+                            job_manager_text = str(first.get("text", ""))
+                            job_manager_port = str(first.get("JobManagerPort", ""))
+                        elif isinstance(cluster_list, dict):
+                            job_manager_type = str(cluster_list.get("JobManagerType", ""))
+                            job_manager_addr = str(cluster_list.get("JobManagerAddr", ""))
+                            job_manager_id_val = str(cluster_list.get("id", ""))
+                            job_manager_text = str(cluster_list.get("text", ""))
+                            job_manager_port = str(cluster_list.get("JobManagerPort", ""))
+                except Exception:
+                    pass
+
         conn = get_db()
         try:
             conn.execute(
-                "UPDATE user_cluster SET homePath = ?, updated_at = ? "
+                "UPDATE user_cluster SET homePath = ?, "
+                "JobManagerType = ?, JobManagerAddr = ?, JobManagerid = ?, "
+                "JobManagertext = ?, JobManagerPort = ?, updated_at = ? "
                 "WHERE userName = ? AND clusterId = ?",
-                (home_path, now, username, cl["clusterId"]),
+                (home_path, job_manager_type, job_manager_addr, job_manager_id_val,
+                 job_manager_text, job_manager_port, now, username, cl["clusterId"]),
             )
             conn.execute(
                 "INSERT OR REPLACE INTO cluster_url(clusterId, clusterName, hpcUrls, aiUrls, efileUrls, eshellUrls) "

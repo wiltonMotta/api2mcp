@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS user_cluster (
     clusterName TEXT,
     homePath    TEXT,
     token       TEXT NOT NULL,
+    isDefault   boolean,
     created_at  datetime,
     updated_at  datetime,
     PRIMARY KEY (userName, clusterId)
