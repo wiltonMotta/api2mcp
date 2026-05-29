@@ -881,7 +881,12 @@ async def get_user_info() -> dict:
 
 
 @mcp.tool()
-async def hpc_hpc_list_available_partitions() -> list[dict]:
+async def hpc_list_available_partitions() -> list[dict]:
+    """列出当前用户在所有集群中真正可用的队列分区。
+
+    自动过滤无可用资源的队列和无队列的集群，返回按集群分组的可用队列信息。
+    调用方可根据返回结果选择合适的集群和队列来提交作业。
+    """
     username = get_current_username()
 
     auth_result = check_auth(username)
@@ -993,7 +998,7 @@ async def hpc_hpc_list_available_partitions() -> list[dict]:
     try:
         conn.execute(
             "INSERT OR REPLACE INTO APIs(name, document) VALUES (?, ?)",
-            ("hpc_hpc_list_available_partitions", json.dumps(doc, ensure_ascii=False)),
+            ("hpc_list_available_partitions", json.dumps(doc, ensure_ascii=False)),
         )
         conn.commit()
     finally:
@@ -1003,7 +1008,7 @@ async def hpc_hpc_list_available_partitions() -> list[dict]:
 
 
 @mcp.tool()
-async def hpc_hpc_submit_job(
+async def hpc_submit_job(
     queueName: str,
     GAP_CMD_FILE: str,
     clusterId: Annotated[Optional[int], Field(description="集群 ID。如果省略，使用当前默认集群；如果提供，则将该集群设为默认。")] = None,
@@ -1022,6 +1027,12 @@ async def hpc_hpc_submit_job(
     GAP_STD_OUT_FILE: Annotated[Optional[str], Field(description="标准输出文件路径。若未提供，默认为工作路径/std.out.%j")] = None,
     GAP_STD_ERR_FILE: Annotated[Optional[str], Field(description="标准错误文件路径。若未提供，默认为工作路径/std.err.%j")] = None,
 ) -> dict:
+    """向 HPC 集群提交一个作业。
+
+    调用前需先通过 hpc_list_available_partitions 获取可用队列信息，
+    并从中选择最合适的队列。后端会自动处理认证、集群凭据获取、
+    调度器 ID 获取、默认值填充以及作业名称生成。
+    """
     username = get_current_username()
 
     # --- P1-5: Parameter validation ---
@@ -1311,7 +1322,7 @@ async def hpc_hpc_submit_job(
     try:
         conn.execute(
             "INSERT OR REPLACE INTO APIs(name, document) VALUES (?, ?)",
-            ("hpc_hpc_submit_job", json.dumps(doc, ensure_ascii=False)),
+            ("hpc_submit_job", json.dumps(doc, ensure_ascii=False)),
         )
         conn.commit()
     finally:
@@ -1326,10 +1337,15 @@ async def hpc_hpc_submit_job(
 
 
 @mcp.tool()
-async def hpc_hpc_get_running_job_detail(
+async def hpc_get_running_job_detail(
     jobId: Annotated[str, Field(description="作业 ID，可从 hpc_submit_job 返回的 jobID 字段获取")],
     clusterId: Annotated[Optional[int], Field(description="可选：集群 ID。如果省略，使用当前默认集群。")] = None,
 ) -> dict:
+    """查询 HPC 集群中指定作业的实时详细信息。
+
+    调用前需先通过 hpc_list_available_partitions 获取可用队列信息。
+    适用于查询正在运行或排队中的作业。若作业已结束，请使用 hpc_get_history_job_detail。
+    """
     username = get_current_username()
 
     # 1. Auth check
@@ -1457,7 +1473,7 @@ async def hpc_hpc_get_running_job_detail(
     try:
         conn.execute(
             "INSERT OR REPLACE INTO APIs(name, document) VALUES (?, ?)",
-            ("hpc_hpc_get_running_job_detail", json.dumps(doc, ensure_ascii=False)),
+            ("hpc_get_running_job_detail", json.dumps(doc, ensure_ascii=False)),
         )
         conn.commit()
     finally:
@@ -1467,10 +1483,15 @@ async def hpc_hpc_get_running_job_detail(
 
 
 @mcp.tool()
-async def hpc_hpc_get_history_job_detail(
+async def hpc_get_history_job_detail(
     jobId: Annotated[str, Field(description="作业 ID，可从 hpc_submit_job 返回的 jobID 字段获取")],
     acctTime: Annotated[Optional[str], Field(description="入账时间（结束时间），建议传入以提升查询性能，格式 YYYY-MM-DD HH:MM:SS")] = None,
 ) -> dict:
+    """查询 HPC 集群中指定历史作业（已完成/已终止）的详细信息。
+
+    调用前需先通过 hpc_list_available_partitions 获取可用队列信息和 jobManagerID，
+    并从 hpc_submit_job 返回结果中获取 jobId。传入 acctTime 可显著提升查询性能。
+    """
     username = get_current_username()
 
     # 1. Auth check
@@ -1580,7 +1601,7 @@ async def hpc_hpc_get_history_job_detail(
     try:
         conn.execute(
             "INSERT OR REPLACE INTO APIs(name, document) VALUES (?, ?)",
-            ("hpc_hpc_get_history_job_detail", json.dumps(doc, ensure_ascii=False)),
+            ("hpc_get_history_job_detail", json.dumps(doc, ensure_ascii=False)),
         )
         conn.commit()
     finally:
@@ -1689,7 +1710,7 @@ async def set_default_cluster(
 
 
 @mcp.tool()
-async def hpc_hpc_list_history_jobs(
+async def hpc_list_history_jobs(
     page: Annotated[int, Field(description="页码，从 1 开始")] = 1,
     size: Annotated[int, Field(description="每页记录数")] = 10,
     clusterId: Annotated[str, Field(description="区域/集群 ID 筛选，传空字符串表示所有区域")] = "",
@@ -1815,7 +1836,7 @@ async def hpc_hpc_list_history_jobs(
     try:
         conn.execute(
             "INSERT OR REPLACE INTO APIs(name, document) VALUES (?, ?)",
-            ("hpc_hpc_list_history_jobs", json.dumps(doc, ensure_ascii=False)),
+            ("hpc_list_history_jobs", json.dumps(doc, ensure_ascii=False)),
         )
         conn.commit()
     finally:
@@ -1825,7 +1846,7 @@ async def hpc_hpc_list_history_jobs(
 
 
 @mcp.tool()
-async def hpc_hpc_list_running_jobs(
+async def hpc_list_running_jobs(
     page: Annotated[int, Field(description="页码，从 1 开始")] = 1,
     size: Annotated[int, Field(description="每页记录数")] = 10,
     clusterId: Annotated[str, Field(description="区域/集群 ID 筛选，传空字符串表示所有区域")] = "",
@@ -2015,7 +2036,7 @@ async def hpc_hpc_list_running_jobs(
     try:
         conn.execute(
             "INSERT OR REPLACE INTO APIs(name, document) VALUES (?, ?)",
-            ("hpc_hpc_list_running_jobs", json.dumps(doc, ensure_ascii=False)),
+            ("hpc_list_running_jobs", json.dumps(doc, ensure_ascii=False)),
         )
         conn.commit()
     finally:
@@ -2025,7 +2046,7 @@ async def hpc_hpc_list_running_jobs(
 
 
 @mcp.tool()
-async def hpc_hpc_cancel_job(
+async def hpc_cancel_job(
     jobId: Annotated[str, Field(description="待取消的作业 ID，多个作业以英文逗号分隔，如 \"63436,63437\"")],
     jobManagerId: Annotated[str, Field(description="调度器 ID。为空时从默认集群自动获取")] = "",
     clusterId: Annotated[int, Field(description="集群 ID。为空时使用默认集群（isDefault=true）")] = None,
@@ -2162,7 +2183,7 @@ async def hpc_hpc_cancel_job(
     try:
         conn.execute(
             "INSERT OR REPLACE INTO APIs(name, document) VALUES (?, ?)",
-            ("hpc_hpc_cancel_job", json.dumps(doc, ensure_ascii=False)),
+            ("hpc_cancel_job", json.dumps(doc, ensure_ascii=False)),
         )
         conn.commit()
     finally:
