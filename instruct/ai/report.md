@@ -10,8 +10,8 @@
 
 | URL 类型 | Token 来源 | 已有代码示例 |
 |----------|-----------|-------------|
-| `www.scnet.cn/ac/openapi/v2/...` | `users.acToken` | `get_user_info` (L830), `list_history_jobs` (L1707), `list_running_jobs` (L1841) |
-| `{hpcUrls}/...` / `{aiUrls}/...` / `{efileUrls}/...` | `user_cluster.token` | `submit_job`, `efile_list_files`, `get_running_job_detail` |
+| `www.scnet.cn/ac/openapi/v2/...` | `users.acToken` | `get_user_info` (L830), `hpc_list_history_jobs` (L1707), `hpc_list_running_jobs` (L1841) |
+| `{hpcUrls}/...` / `{aiUrls}/...` / `{efileUrls}/...` | `user_cluster.token` | `hpc_submit_job`, `efile_list_files`, `hpc_get_running_job_detail` |
 
 **违反此规则的 3 个文档：**
 
@@ -21,7 +21,7 @@
 | `notebook_start` | `www.scnet.cn/ac/openapi/v2/notebook/actions/start` | `_get_default_token()` (集群 token) | `users.acToken` |
 | `notebook_list_resources` | `www.scnet.cn/ac/openapi/v2/resources/accelerators` | `_get_default_token()` (集群 token) | `users.acToken` |
 
-**修复建议:** 这三个工具应改为从 `users` 表读取 `acToken`，参考 `list_history_jobs` (main.py:1703-1722) 的实现模式。
+**修复建议:** 这三个工具应改为从 `users` 表读取 `acToken`，参考 `hpc_list_history_jobs` (main.py:1703-1722) 的实现模式。
 
 ### 1.2 URL 路由不一致：同类操作使用不同的 API 入口
 
@@ -189,7 +189,7 @@ SQL 查询中没有 `cu.aiUrls`！这意味着 `_get_default_token()` 当前不�
 
 ### 5.2 平台级 AC URL 的 token 获取模式
 
-`main.py` 中 `list_history_jobs` (L1706-1722) 和 `list_running_jobs` (L1841-1856) 为 AC URL 获取 `acToken` 的模式是：
+`main.py` 中 `hpc_list_history_jobs` (L1706-1722) 和 `hpc_list_running_jobs` (L1841-1856) 为 AC URL 获取 `acToken` 的模式是：
 1. 从 `users` 表查 `acToken`
 2. 检查是否为 None
 3. 直接使用 `acToken` 作为 HTTP header `token`

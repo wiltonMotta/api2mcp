@@ -61,7 +61,7 @@
 
 ### 2.4 `clusterId` 提升为默认集群的行为未定义
 
-现有 `submit_job` 实现中，当用户显式传入 `clusterId` 时，会将该集群提升为 `isDefault=true`。但 efile 设计文档没有说明是否要沿用此行为。已实现的 `efile_list_files` 没有做提升。需要在文档中明确决策。
+现有 `hpc_submit_job` 实现中，当用户显式传入 `clusterId` 时，会将该集群提升为 `isDefault=true`。但 efile 设计文档没有说明是否要沿用此行为。已实现的 `efile_list_files` 没有做提升。需要在文档中明确决策。
 
 ---
 

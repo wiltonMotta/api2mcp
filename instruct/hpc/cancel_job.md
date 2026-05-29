@@ -1,13 +1,13 @@
-# cancel_job
+# hpc_cancel_job
 
 ## 需求
 
-实现一个 MCP tool `cancel_job`，取消/删除 HPC 集群中正在运行或排队的作业。支持批量取消。
+实现一个 MCP tool `hpc_cancel_job`，取消/删除 HPC 集群中正在运行或排队的作业。支持批量取消。
 
 ## 前置条件
 
 - 用户需先完成 AK/SK 认证（`/auth/{username}`），确保 `user_cluster` 表中存在有效的集群 token
-- 需先调用 `list_available_partitions` 或 `list_running_jobs` 获取 `jobManagerId` 和 `clusterUserName`
+- 需先调用 `hpc_hpc_list_available_partitions` 或 `hpc_list_running_jobs` 获取 `jobManagerId` 和 `clusterUserName`
 
 ## 认证
 
@@ -106,12 +106,12 @@
 ## 自动注册
 
 - 从返回数据中通过 `_build_return_schema(data)` 自动生成返回 schema
-- 将工具描述文档写入 `APIs` 表（`INSERT OR REPLACE`），name 为 `cancel_job`
+- 将工具描述文档写入 `APIs` 表（`INSERT OR REPLACE`），name 为 `hpc_cancel_job`
 - document JSON 包含 url、method、description、parameters（含所有参数的 schema）、returns（format 为 JSON，schema 为自动推导）
 
 ## 与其他工具的对比
 
-| 维度 | cancel_job | list_running_jobs | list_history_jobs |
+| 维度 | hpc_cancel_job | hpc_list_running_jobs | hpc_list_history_jobs |
 |------|------------|-------------------|-------------------|
 | 入口 | 集群 HPC 服务 | AC 统一服务 | AC 统一服务 |
 | 认证 token | `user_cluster.token` | `users.acToken` | `users.acToken` |
@@ -121,4 +121,4 @@
 
 ## 代码位置
 
-`main.py` 中新增 `@mcp.tool()` 装饰的 `cancel_job` 函数。
+`main.py` 中新增 `@mcp.tool()` 装饰的 `hpc_cancel_job` 函数。

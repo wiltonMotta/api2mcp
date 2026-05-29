@@ -37,7 +37,7 @@
 | `notebook_status` | string | 否 | `None` | `notebookStatus` | query | Notebook 状态：`Creating`（创建中）、`Restarting`（开机中）、`Running`（运行中）、`Terminated`（已关机）、`Failed`（失败）、`Shutting`（关机中） |
 | `page` | integer | 否 | `1` | `page` | query | 分页页码，默认 1 |
 | `size` | integer | 否 | `20` | `size` | query | 分页大小，默认 20 |
-| `cluster_id` | integer | 否 | `None` | — | — | 集群 ID。为空时使用默认集群（`isDefault=true`）。需从 `list_available_partitions` 或 `user_cluster` 表获取 |
+| `cluster_id` | integer | 否 | `None` | — | — | 集群 ID。为空时使用默认集群（`isDefault=true`）。需从 `hpc_hpc_list_available_partitions` 或 `user_cluster` 表获取 |
 
 注：MCP 参数 `notebook_name` 映射到 OpenAPI 的 `notebookName`（camelCase）；`notebook_status` 映射到 `notebookStatus`。
 

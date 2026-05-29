@@ -7,7 +7,7 @@
 ## 前置条件
 
 - 用户需先完成 AK/SK 认证（`/auth/{username}`），确保 `user_cluster` 表中存在有效的集群 token
-- 需先调用 `list_available_partitions` 或从 `user_cluster` 表获取 efileUrls
+- 需先调用 `hpc_hpc_list_available_partitions` 或从 `user_cluster` 表获取 efileUrls
 
 ## 认证
 

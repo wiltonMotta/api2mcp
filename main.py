@@ -319,7 +319,7 @@ def _get_default_token(username: str) -> dict:
                     "error": True,
                     "message": (
                         "未找到可用的默认集群。"
-                        "请先调用 list_available_partitions 获取可用队列。"
+                        "请先调用 hpc_list_available_partitions 获取可用队列。"
                     ),
                 }
 
@@ -881,7 +881,7 @@ async def get_user_info() -> dict:
 
 
 @mcp.tool()
-async def list_available_partitions() -> list[dict]:
+async def hpc_hpc_list_available_partitions() -> list[dict]:
     username = get_current_username()
 
     auth_result = check_auth(username)
@@ -993,7 +993,7 @@ async def list_available_partitions() -> list[dict]:
     try:
         conn.execute(
             "INSERT OR REPLACE INTO APIs(name, document) VALUES (?, ?)",
-            ("list_available_partitions", json.dumps(doc, ensure_ascii=False)),
+            ("hpc_hpc_list_available_partitions", json.dumps(doc, ensure_ascii=False)),
         )
         conn.commit()
     finally:
@@ -1003,7 +1003,7 @@ async def list_available_partitions() -> list[dict]:
 
 
 @mcp.tool()
-async def submit_job(
+async def hpc_hpc_submit_job(
     queueName: str,
     GAP_CMD_FILE: str,
     clusterId: Annotated[Optional[int], Field(description="集群 ID。如果省略，使用当前默认集群；如果提供，则将该集群设为默认。")] = None,
@@ -1097,7 +1097,7 @@ async def submit_job(
             "error": True,
             "message": (
                 f"未在集群 clusterId={clusterId} 中找到您的认证凭证。"
-                "请先调用 list_available_partitions 获取可用队列，然后选择有效的集群。"
+                "请先调用 hpc_list_available_partitions 获取可用队列，然后选择有效的集群。"
             ),
         }
     if row["token"] is None:
@@ -1105,7 +1105,7 @@ async def submit_job(
             "error": True,
             "message": (
                 f"未在集群 clusterId={clusterId} 中找到您的认证凭证。"
-                " 请先调用 list_available_partitions 获取可用队列，然后选择有效的集群。"
+                " 请先调用 hpc_list_available_partitions 获取可用队列，然后选择有效的集群。"
             ),
         }
 
@@ -1276,7 +1276,7 @@ async def submit_job(
         "url": "{hpcUrls}/hpc/openapi/v2/apptemplates/{apptype}/{appname}/job",
         "method": "POST",
         "description": (
-            "向 HPC 集群提交一个作业。调用前需先通过 list_available_partitions 获取可用队列信息，"
+            "向 HPC 集群提交一个作业。调用前需先通过 hpc_list_available_partitions 获取可用队列信息，"
             "并从中选择最合适的队列。后端会自动处理认证、集群凭据获取、调度器 ID 获取、"
             "默认值填充以及作业名称生成。"
         ),
@@ -1311,7 +1311,7 @@ async def submit_job(
     try:
         conn.execute(
             "INSERT OR REPLACE INTO APIs(name, document) VALUES (?, ?)",
-            ("submit_job", json.dumps(doc, ensure_ascii=False)),
+            ("hpc_hpc_submit_job", json.dumps(doc, ensure_ascii=False)),
         )
         conn.commit()
     finally:
@@ -1326,8 +1326,8 @@ async def submit_job(
 
 
 @mcp.tool()
-async def get_running_job_detail(
-    jobId: Annotated[str, Field(description="作业 ID，可从 submit_job 返回的 jobID 字段获取")],
+async def hpc_hpc_get_running_job_detail(
+    jobId: Annotated[str, Field(description="作业 ID，可从 hpc_submit_job 返回的 jobID 字段获取")],
     clusterId: Annotated[Optional[int], Field(description="可选：集群 ID。如果省略，使用当前默认集群。")] = None,
 ) -> dict:
     username = get_current_username()
@@ -1356,7 +1356,7 @@ async def get_running_job_detail(
                 "error": True,
                 "message": (
                     f"未在集群 clusterId={clusterId} 中找到您的认证凭证。"
-                    "请先调用 list_available_partitions 获取可用队列。"
+                    "请先调用 hpc_list_available_partitions 获取可用队列。"
                 ),
             }
         effective_token = row["token"]
@@ -1366,7 +1366,7 @@ async def get_running_job_detail(
                 "error": True,
                 "message": (
                     f"未在集群 clusterId={clusterId} 中找到您的认证凭证。"
-                    "请先调用 list_available_partitions 获取可用队列。"
+                    "请先调用 hpc_list_available_partitions 获取可用队列。"
                 ),
             }
     else:
@@ -1425,7 +1425,7 @@ async def get_running_job_detail(
             "message": (
                 f"作业 {jobId} 在当前集群上未找到。"
                 "可能原因：1) 作业 ID 不正确；2) 作业属于其他集群，请指定 clusterId 重试；"
-                "3) 实时作业已结束，请使用 get_history_job_detail 查询历史作业。"
+                "3) 实时作业已结束，请使用 hpc_get_history_job_detail 查询历史作业。"
             ),
         }
 
@@ -1435,13 +1435,13 @@ async def get_running_job_detail(
         "url": "{hpcUrls}/hpc/openapi/v2/jobs/{jobId}",
         "method": "GET",
         "description": (
-            "查询 HPC 集群中指定作业的实时详细信息。调用前需先通过 list_available_partitions "
+            "查询 HPC 集群中指定作业的实时详细信息。调用前需先通过 hpc_list_available_partitions "
             "获取可用队列信息，选择正确的集群和 jobId。后端会自动处理认证和集群信息。"
         ),
         "parameters": {
             "format": "URLParameter",
             "schema": {
-                "jobId": {"type": "string", "description": "作业 ID，可从 submit_job 返回的 jobID 字段获取", "optional": False},
+                "jobId": {"type": "string", "description": "作业 ID，可从 hpc_submit_job 返回的 jobID 字段获取", "optional": False},
                 "clusterId": {"type": "integer", "description": "可选：集群 ID，用于精确匹配", "optional": True},
             },
         },
@@ -1457,7 +1457,7 @@ async def get_running_job_detail(
     try:
         conn.execute(
             "INSERT OR REPLACE INTO APIs(name, document) VALUES (?, ?)",
-            ("get_running_job_detail", json.dumps(doc, ensure_ascii=False)),
+            ("hpc_hpc_get_running_job_detail", json.dumps(doc, ensure_ascii=False)),
         )
         conn.commit()
     finally:
@@ -1467,8 +1467,8 @@ async def get_running_job_detail(
 
 
 @mcp.tool()
-async def get_history_job_detail(
-    jobId: Annotated[str, Field(description="作业 ID，可从 submit_job 返回的 jobID 字段获取")],
+async def hpc_hpc_get_history_job_detail(
+    jobId: Annotated[str, Field(description="作业 ID，可从 hpc_submit_job 返回的 jobID 字段获取")],
     acctTime: Annotated[Optional[str], Field(description="入账时间（结束时间），建议传入以提升查询性能，格式 YYYY-MM-DD HH:MM:SS")] = None,
 ) -> dict:
     username = get_current_username()
@@ -1489,7 +1489,7 @@ async def get_history_job_detail(
     if not hpc_urls:
         return {
             "error": True,
-            "message": "未查询到集群 HPC 服务 URL。请先调用 list_available_partitions 获取可用队列。",
+            "message": "未查询到集群 HPC 服务 URL。请先调用 hpc_list_available_partitions 获取可用队列。",
         }
 
     # 3. Query via round-robin on hpcUrls
@@ -1552,13 +1552,13 @@ async def get_history_job_detail(
         "method": "GET",
         "description": (
             "查询 HPC 集群中指定历史作业（已完成/已终止）的详细信息。"
-            "调用前需先通过 list_available_partitions 获取可用队列信息和 jobManagerID，"
+            "调用前需先通过 hpc_list_available_partitions 获取可用队列信息和 jobManagerID，"
             "并从提交结果中获取 jobId。后端会自动处理认证和集群信息。"
         ),
         "parameters": {
             "format": "URLParameter",
             "schema": {
-                "jobId": {"type": "string", "description": "作业 ID，可从 submit_job 返回的 jobID 字段获取", "optional": False},
+                "jobId": {"type": "string", "description": "作业 ID，可从 hpc_submit_job 返回的 jobID 字段获取", "optional": False},
                 "acctTime": {"type": "string", "description": "入账时间（结束时间），建议传入以提升查询性能，格式 YYYY-MM-DD HH:MM:SS", "optional": True},
             },
         },
@@ -1580,7 +1580,7 @@ async def get_history_job_detail(
     try:
         conn.execute(
             "INSERT OR REPLACE INTO APIs(name, document) VALUES (?, ?)",
-            ("get_history_job_detail", json.dumps(doc, ensure_ascii=False)),
+            ("hpc_hpc_get_history_job_detail", json.dumps(doc, ensure_ascii=False)),
         )
         conn.commit()
     finally:
@@ -1626,7 +1626,7 @@ async def set_default_cluster(
                     "error": True,
                     "message": (
                         f"集群 clusterId={clusterId} 不属于用户 '{username}'。"
-                        "请先调用 list_available_partitions 获取可用集群。"
+                        "请先调用 hpc_list_available_partitions 获取可用集群。"
                     ),
                 }
             target_id = row["clusterId"]
@@ -1645,7 +1645,7 @@ async def set_default_cluster(
                     "message": (
                         f"用户 '{username}' 下未找到名称包含 "
                         f"'{clusterName.strip()}' 的集群。"
-                        "请先调用 list_available_partitions 获取可用集群。"
+                        "请先调用 hpc_list_available_partitions 获取可用集群。"
                     ),
                 }
 
@@ -1689,7 +1689,7 @@ async def set_default_cluster(
 
 
 @mcp.tool()
-async def list_history_jobs(
+async def hpc_hpc_list_history_jobs(
     page: Annotated[int, Field(description="页码，从 1 开始")] = 1,
     size: Annotated[int, Field(description="每页记录数")] = 10,
     clusterId: Annotated[str, Field(description="区域/集群 ID 筛选，传空字符串表示所有区域")] = "",
@@ -1705,7 +1705,7 @@ async def list_history_jobs(
     """跨区域聚合查询历史作业列表。
 
     通过 AC 服务统一入口，单次请求返回所有区域的作业记录。
-    与 get_history_job_detail 不同：本工具做列表分页查询，后者按 jobId 精确查单条。
+    与 hpc_get_history_job_detail 不同：本工具做列表分页查询，后者按 jobId 精确查单条。
     """
     username = get_current_username()
 
@@ -1815,7 +1815,7 @@ async def list_history_jobs(
     try:
         conn.execute(
             "INSERT OR REPLACE INTO APIs(name, document) VALUES (?, ?)",
-            ("list_history_jobs", json.dumps(doc, ensure_ascii=False)),
+            ("hpc_hpc_list_history_jobs", json.dumps(doc, ensure_ascii=False)),
         )
         conn.commit()
     finally:
@@ -1825,7 +1825,7 @@ async def list_history_jobs(
 
 
 @mcp.tool()
-async def list_running_jobs(
+async def hpc_hpc_list_running_jobs(
     page: Annotated[int, Field(description="页码，从 1 开始")] = 1,
     size: Annotated[int, Field(description="每页记录数")] = 10,
     clusterId: Annotated[str, Field(description="区域/集群 ID 筛选，传空字符串表示所有区域")] = "",
@@ -1839,7 +1839,7 @@ async def list_running_jobs(
     """跨区域聚合查询实时作业列表。
 
     通过 AC 服务统一入口，单次请求返回所有区域的实时作业（运行中/排队中/挂起等活跃状态）。
-    与 list_history_jobs 不同：本工具查活跃作业，后者查终态历史作业。
+    与 hpc_list_history_jobs 不同：本工具查活跃作业，后者查终态历史作业。
     """
     username = get_current_username()
 
@@ -2015,7 +2015,7 @@ async def list_running_jobs(
     try:
         conn.execute(
             "INSERT OR REPLACE INTO APIs(name, document) VALUES (?, ?)",
-            ("list_running_jobs", json.dumps(doc, ensure_ascii=False)),
+            ("hpc_hpc_list_running_jobs", json.dumps(doc, ensure_ascii=False)),
         )
         conn.commit()
     finally:
@@ -2025,7 +2025,7 @@ async def list_running_jobs(
 
 
 @mcp.tool()
-async def cancel_job(
+async def hpc_hpc_cancel_job(
     jobId: Annotated[str, Field(description="待取消的作业 ID，多个作业以英文逗号分隔，如 \"63436,63437\"")],
     jobManagerId: Annotated[str, Field(description="调度器 ID。为空时从默认集群自动获取")] = "",
     clusterId: Annotated[int, Field(description="集群 ID。为空时使用默认集群（isDefault=true）")] = None,
@@ -2056,7 +2056,7 @@ async def cancel_job(
                     "error": True,
                     "message": (
                         f"集群 clusterId={clusterId} 不属于用户 '{username}'。"
-                        "请先调用 list_available_partitions 获取可用集群。"
+                        "请先调用 hpc_list_available_partitions 获取可用集群。"
                     ),
                 }
             token = row["token"]
@@ -2078,13 +2078,13 @@ async def cancel_job(
     if not hpc_urls:
         return {
             "error": True,
-            "message": "未查询到集群 HPC 服务 URL。请先调用 list_available_partitions 获取可用队列。",
+            "message": "未查询到集群 HPC 服务 URL。请先调用 hpc_list_available_partitions 获取可用队列。",
         }
 
     if not job_manager_id:
         return {
             "error": True,
-            "message": "未获取到调度器 ID（jobManagerId）。请先调用 list_available_partitions 获取。",
+            "message": "未获取到调度器 ID（jobManagerId）。请先调用 hpc_list_available_partitions 获取。",
         }
 
     # 3. Build strJobInfoMap: jobManagerId,userName:jobId:; for each jobId
@@ -2162,7 +2162,7 @@ async def cancel_job(
     try:
         conn.execute(
             "INSERT OR REPLACE INTO APIs(name, document) VALUES (?, ?)",
-            ("cancel_job", json.dumps(doc, ensure_ascii=False)),
+            ("hpc_hpc_cancel_job", json.dumps(doc, ensure_ascii=False)),
         )
         conn.commit()
     finally:
@@ -2210,7 +2210,7 @@ async def efile_list_files(
                     "error": True,
                     "message": (
                         f"集群 clusterId={clusterId} 不属于用户 '{username}'。"
-                        "请先调用 list_available_partitions 获取可用集群。"
+                        "请先调用 hpc_list_available_partitions 获取可用集群。"
                     ),
                 }
             token = row["token"]
@@ -2227,7 +2227,7 @@ async def efile_list_files(
     if not efile_urls:
         return {
             "error": True,
-            "message": "未查询到文件服务 URL（efileUrls）。请先调用 list_available_partitions 获取可用集群。",
+            "message": "未查询到文件服务 URL（efileUrls）。请先调用 hpc_list_available_partitions 获取可用集群。",
         }
 
     # 3. Build query params
@@ -3481,7 +3481,7 @@ async def efile_download(
 
 @mcp.tool()
 async def notebook_list_resources(
-    cluster_ids: Annotated[str, Field(description="区域 ID 列表（逗号分隔，如 \"11250,20057\"）。可从 list_available_partitions 获取")],
+    cluster_ids: Annotated[str, Field(description="区域 ID 列表（逗号分隔，如 \"11250,20057\"）。可从 hpc_list_available_partitions 获取")],
     resource_id: Annotated[Optional[str], Field(description="资源 ID，用于筛选特定型号")] = None,
     cluster_id: Annotated[Optional[int], Field(description="集群 ID（仅用于获取 acToken 时的上下文参考）")] = None,
 ) -> dict:
@@ -4760,62 +4760,10 @@ async def notebook_start_custom_service(
 # Entry point
 # ---------------------------------------------------------------------------
 
-def _register_history_job_detail_doc() -> None:
-    """注册 get_history_job_detail 的文档到 APIs 表（启动时执行）。"""
-    doc = {
-        "url": "{hpcUrls}/hpc/openapi/v2/historyjobs/{jobmanagerId}/{jobId}",
-        "method": "GET",
-        "description": (
-            "查询 HPC 集群中指定历史作业（已完成/已终止）的详细信息。"
-            "调用前需先通过 list_available_partitions 获取可用队列信息和 jobManagerID，"
-            "并从提交结果中获取 jobId。后端会自动处理认证和集群信息。"
-        ),
-        "parameters": {
-            "format": "URLParameter",
-            "schema": {
-                "jobId": {"type": "string", "description": "作业 ID，可从 submit_job 返回的 jobID 字段获取", "optional": False},
-                "acctTime": {"type": "string", "description": "入账时间（结束时间），建议传入以提升查询性能，格式 YYYY-MM-DD HH:MM:SS", "optional": True},
-            },
-        },
-        "returns": {
-            "format": "JSON",
-            "schema": {
-                "acctTime": {"type": "string", "description": "入账时间", "optional": True},
-                "jobId": {"type": "string", "description": "作业 ID", "optional": False},
-                "jobmanagerId": {"type": "number", "description": "调度器 ID", "optional": False},
-                "jobmanagerName": {"type": "string", "description": "集群名称", "optional": True},
-                "userName": {"type": "string", "description": "用户名", "optional": True},
-                "jobName": {"type": "string", "description": "作业名称", "optional": True},
-                "queue": {"type": "string", "description": "队列名称", "optional": True},
-                "jobQueueTime": {"type": "string", "description": "排队开始时间", "optional": True},
-                "jobStartTime": {"type": "string", "description": "开始时间", "optional": False},
-                "jobEndTime": {"type": "string", "description": "结束时间", "optional": False},
-                "jobExitStatus": {"type": "number", "description": "退出状态码", "optional": True},
-                "jobCpuTime": {"type": "number", "description": "CPU时间(秒)", "optional": True},
-                "jobMemUsed": {"type": "number", "description": "已用内存(MB)", "optional": True},
-                "jobExecHost": {"type": "string", "description": "执行节点", "optional": True},
-                "jobState": {"type": "string", "description": "作业状态", "optional": True},
-            },
-        },
-    }
-    conn = get_db()
-    try:
-        conn.execute(
-            "INSERT OR REPLACE INTO APIs(name, document) VALUES (?, ?)",
-            ("get_history_job_detail", json.dumps(doc, ensure_ascii=False)),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
 # Register existing DB proxy tools at import time
 _count = register_apis(mcp)
 if _count:
     print(f"[mcp] registered {_count} proxy API tool(s) from {DB_PATH}")
-
-# Pre-register built-in tool docs so they appear in tool list immediately
-_register_history_job_detail_doc()
-print("[mcp] pre-registered get_history_job_detail in APIs table")
 
 
 def main() -> None:

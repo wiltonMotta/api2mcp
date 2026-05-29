@@ -1,15 +1,15 @@
 INSERT OR REPLACE INTO APIs (name, document) VALUES (
-    'submit_job',
+    'hpc_submit_job',
     '{
         "url": "{hpcUrls}/hpc/openapi/v2/apptemplates/{apptype}/{appname}/job",
         "method": "POST",
-        "description": "向 HPC 集群提交一个作业。调用前需先通过 list_available_partitions 获取可用队列信息，并从中选择最合适的队列。后端会自动处理认证、集群凭据获取、调度器 ID 获取、默认值填充以及作业名称生成。",
+        "description": "向 HPC 集群提交一个作业。调用前需先通过 hpc_hpc_list_available_partitions 获取可用队列信息，并从中选择最合适的队列。后端会自动处理认证、集群凭据获取、调度器 ID 获取、默认值填充以及作业名称生成。",
         "parameters": {
             "format": "JSON",
             "schema": {
                 "clusterId": {
                     "type": "integer",
-                    "description": "从 list_available_partitions 返回结果中选定的集群 ID",
+                    "description": "从 hpc_hpc_list_available_partitions 返回结果中选定的集群 ID",
                     "optional": false
                 },
                 "queueName": {

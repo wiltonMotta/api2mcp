@@ -1,8 +1,8 @@
-# list_history_jobs
+# hpc_list_history_jobs
 
 ## 需求
 
-实现一个 MCP tool `list_history_jobs`，跨区域聚合查询历史作业列表。通过 AC 服务统一入口，单次请求返回所有区域的作业记录，无需逐区域遍历。
+实现一个 MCP tool `hpc_list_history_jobs`，跨区域聚合查询历史作业列表。通过 AC 服务统一入口，单次请求返回所有区域的作业记录，无需逐区域遍历。
 
 ## 前置条件
 
@@ -342,12 +342,12 @@
 ## 自动注册
 
 - 从返回数据中通过 `_build_return_schema(data)` 自动生成返回 schema
-- 将工具描述文档写入 `APIs` 表（`INSERT OR REPLACE`），name 为 `list_history_jobs`
+- 将工具描述文档写入 `APIs` 表（`INSERT OR REPLACE`），name 为 `hpc_list_history_jobs`
 - document JSON 包含 url、method、description、parameters（含所有参数的 schema）、returns（format 为 JSON，schema 为自动推导）
 
-## 与 get_history_job_detail 的区别
+## 与 hpc_get_history_job_detail 的区别
 
-| 维度 | list_history_jobs | get_history_job_detail |
+| 维度 | hpc_list_history_jobs | hpc_get_history_job_detail |
 |------|-------------------|------------------------|
 | 入口 | AC 统一服务 (`www.scnet.cn`) | 各集群 HPC 服务 |
 | 认证 token | `users.acToken`（AC token） | `user_cluster.token`（集群 token） |
@@ -358,4 +358,4 @@
 
 ## 代码位置
 
-`main.py` 中新增 `@mcp.tool()` 装饰的 `list_history_jobs` 函数。
+`main.py` 中新增 `@mcp.tool()` 装饰的 `hpc_list_history_jobs` 函数。

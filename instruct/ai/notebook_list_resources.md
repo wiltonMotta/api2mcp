@@ -7,12 +7,12 @@
 ## 前置条件
 
 - 用户需先完成 AK/SK 认证（`/auth/{username}`），确保 `users` 表中存在有效的 `acToken`
-- 需要已知 `clusterId`，可通过 `list_available_partitions` 获取
+- 需要已知 `clusterId`，可通过 `hpc_hpc_list_available_partitions` 获取
 
 ## 认证
 
 - 从 HTTP 请求路径参数中提取当前 `username`（通过 `get_current_username()`）
-- **Token 类型**：本接口使用平台级 AC URL（`www.scnet.cn/ac/openapi/v2/...`），因此使用 `users.acToken` 而非集群 token。参考 `list_history_jobs`（main.py）中 AC URL 的认证模式。
+- **Token 类型**：本接口使用平台级 AC URL（`www.scnet.cn/ac/openapi/v2/...`），因此使用 `users.acToken` 而非集群 token。参考 `hpc_list_history_jobs`（main.py）中 AC URL 的认证模式。
 - acToken 获取方式：
   ```sql
   SELECT acToken FROM users WHERE userName = {current_username}
@@ -29,7 +29,7 @@
 
 | MCP 参数 | 类型 | 必填 | 默认值 | OpenAPI 参数 | 参数位置 | 说明 |
 |----------|------|------|--------|-------------|---------|------|
-| `cluster_ids` | string | 是 | — | `clusterIds` | query | 区域 ID 列表（逗号分隔，如 `"11250,20057"`）。可从 `list_available_partitions` 获取 |
+| `cluster_ids` | string | 是 | — | `clusterIds` | query | 区域 ID 列表（逗号分隔，如 `"11250,20057"`）。可从 `hpc_hpc_list_available_partitions` 获取 |
 | `resource_id` | string | 否 | `None` | `resourceId` | query | 资源 ID，用于筛选特定型号。可从本工具的上次调用结果中获取 |
 | `cluster_id` | integer | 否 | `None` | — | — | 集群 ID（仅用于获取 acToken 时的上下文参考）。为空时使用默认集群 |
 
@@ -87,7 +87,7 @@
 ## 工具关联关系
 
 - **入参依赖**：
-  - `cluster_ids` ← `list_available_partitions` 的 `clusterId`
+  - `cluster_ids` ← `hpc_hpc_list_available_partitions` 的 `clusterId`
 - **被依赖**：本工具返回的资源信息供 `notebook_create` 使用：
   - `clusterId` → `notebook_create` 的 `cluster_id`
   - `resourceGroupCode` → `notebook_create` 的 `resource_group_code`

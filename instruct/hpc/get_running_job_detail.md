@@ -1,8 +1,8 @@
-# get_running_job_detail
+# hpc_get_running_job_detail
 
 ## 需求
 
-实现一个 MCP tool `get_running_job_detail`，根据 `jobId` 查询 HPC 集群中某个作业的详细信息（实时状态）。
+实现一个 MCP tool `hpc_get_running_job_detail`，根据 `jobId` 查询 HPC 集群中某个作业的详细信息（实时状态）。
 
 ## 前置条件
 
@@ -18,10 +18,10 @@
 
 | 参数名 | 类型 | 必填 | 默认值 / 来源说明 |
 |--------|------|------|-------------------|
-| `jobId` | string | 是 | 作业 ID（可从 `submit_job` 返回的 `jobID` 字段获取） |
+| `jobId` | string | 是 | 作业 ID（可从 `hpc_submit_job` 返回的 `jobID` 字段获取） |
 | `clusterId` | integer | 否 | 可选：集群 ID。精确匹配可减少查询失败概率。如果省略，后端会自动遍历用户有权限的所有集群尝试查询。 |
-| `token` | string | 否 | 可选：集群 token（可从 `submit_job` 返回的 `token` 字段获取）。如果省略，后端从数据库自动获取。 |
-| `hpcUrls` | string | 否 | 可选：集群 hpcUrls（可从 `submit_job` 返回的 `hpcUrls` 字段获取）。如果省略，后端从数据库自动获取。 |
+| `token` | string | 否 | 可选：集群 token（可从 `hpc_submit_job` 返回的 `token` 字段获取）。如果省略，后端从数据库自动获取。 |
+| `hpcUrls` | string | 否 | 可选：集群 hpcUrls（可从 `hpc_submit_job` 返回的 `hpcUrls` 字段获取）。如果省略，后端从数据库自动获取。 |
 
 ## 后端处理逻辑
 
@@ -54,9 +54,9 @@
 ## 自动注册
 
 - 从返回数据中通过 `_build_return_schema(data)` 自动生成返回 schema
-- 将工具描述文档写入 `APIs` 表（`INSERT OR REPLACE`），name 为 `get_running_job_detail`
+- 将工具描述文档写入 `APIs` 表（`INSERT OR REPLACE`），name 为 `hpc_get_running_job_detail`
 - document JSON 包含 url、method、description、parameters（含所有参数的 schema）、returns（format 为 JSON，schema 为自动推导）
 
 ## 代码位置
 
-`main.py` 中 `@mcp.tool()` 装饰的 `get_running_job_detail` 函数。
+`main.py` 中 `@mcp.tool()` 装饰的 `hpc_get_running_job_detail` 函数。

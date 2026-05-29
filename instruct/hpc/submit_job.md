@@ -1,12 +1,12 @@
-# submit_job
+# hpc_submit_job
 
 ## 需求
 
-实现一个 MCP tool `submit_job`，根据用户需求和集群队列信息，向 HPC 集群提交一个作业。
+实现一个 MCP tool `hpc_submit_job`，根据用户需求和集群队列信息，向 HPC 集群提交一个作业。
 
 ## 前置条件
 
-- 调用本工具前，必须先调用 `list_available_partitions` 工具获取可用队列信息
+- 调用本工具前，必须先调用 `hpc_hpc_list_available_partitions` 工具获取可用队列信息
 - 根据用户需求（如计算资源大小、队列类型等），从返回结果中选择一个最合适的队列
 
 ## 认证
@@ -54,7 +54,7 @@ Body:
 
 | 参数名 | 类型 | 必填 | 默认值 / 来源说明 |
 |--------|------|------|-------------------|
-| `clusterId` | integer | 是 | 从 `list_available_partitions` 返回结果中选定的集群 ID |
+| `clusterId` | integer | 是 | 从 `hpc_hpc_list_available_partitions` 返回结果中选定的集群 ID |
 | `queueName` | string | 是 | 从选定集群的 `queues` 列表中选择的目标队列名称（对应队列对象的 `queName` 字段） |
 | `GAP_CMD_FILE` | string | 是 | 作业要执行的命令行内容（如需换行，使用 `\n` 转义）。例如：`sleep 500`、`python train.py` |
 | `GAP_NNODE` | string | 否 | 节点个数。与 `GAP_NODE_STRING` 互斥——两者不能同时填写有效值。默认 `"1"` |
@@ -119,9 +119,9 @@ Body:
 ## 自动注册
 
 - 从返回数据中通过 `_build_return_schema(data)` 自动生成返回 schema
-- 将工具描述文档写入 `APIs` 表（`INSERT OR REPLACE`），name 为 `submit_job`
+- 将工具描述文档写入 `APIs` 表（`INSERT OR REPLACE`），name 为 `hpc_submit_job`
 - document JSON 包含 url、method、description、parameters（含所有参数的 schema）、returns（format 为 JSON，schema 为自动推导）
 
 ## 代码位置
 
-`main.py` 中 `@mcp.tool()` 装饰的 `submit_job` 函数。
+`main.py` 中 `@mcp.tool()` 装饰的 `hpc_submit_job` 函数。

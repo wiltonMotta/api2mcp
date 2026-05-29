@@ -13,7 +13,7 @@
 ## 认证
 
 - 从 HTTP 请求路径参数中提取当前 `username`（通过 `get_current_username()`）
-- **Token 类型**：本接口使用平台级 AC URL（`www.scnet.cn/ac/openapi/v2/...`），因此使用 `users.acToken` 而非集群 token。参考 `list_history_jobs`（main.py）中 AC URL 的认证模式。
+- **Token 类型**：本接口使用平台级 AC URL（`www.scnet.cn/ac/openapi/v2/...`），因此使用 `users.acToken` 而非集群 token。参考 `hpc_list_history_jobs`（main.py）中 AC URL 的认证模式。
 - acToken 获取方式：
   ```sql
   SELECT acToken FROM users WHERE userName = {current_username}
