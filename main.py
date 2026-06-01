@@ -253,6 +253,25 @@ def migrate_db() -> None:
 AUTH_BASE_URL = "https://c-2056205187675406338.qdai.scnet.cn:58043"
 
 
+def _enrich_auth_error(response: Any, username: str) -> Any:
+    """If *response* is a dict with code==\"10008\" (token expired), inject
+    an *auth_url* hint so callers know how to re-authenticate.
+
+    Returns the (possibly modified) response dict, or the original value
+    unchanged when it does not match the pattern.
+    """
+    if isinstance(response, dict) and str(response.get("code", "")) == "10008":
+        response = dict(response)  # copy so we never mutate upstream data
+        msg = response.get("msg", "")
+        response["msg"] = (
+            f"{msg}。请访问认证页面重新获取访问凭证。"
+            if msg
+            else "请访问认证页面重新获取访问凭证。"
+        )
+        response["auth_url"] = f"{AUTH_BASE_URL}/auth/{username}"
+    return response
+
+
 def check_auth(username: str) -> sqlite3.Row | dict:
     """Check whether a user is authenticated.
 
@@ -877,7 +896,7 @@ async def get_user_info() -> dict:
     finally:
         conn.close()
 
-    return data
+    return _enrich_auth_error(data, username)
 
 
 @mcp.tool()
@@ -1333,7 +1352,7 @@ async def hpc_submit_job(
         result["token"] = token
         result["hpcUrls"] = hpc_urls
 
-    return result
+    return _enrich_auth_error(result, username)
 
 
 @mcp.tool()
@@ -1479,7 +1498,7 @@ async def hpc_get_running_job_detail(
     finally:
         conn.close()
 
-    return result
+    return _enrich_auth_error(result, username)
 
 
 @mcp.tool()
@@ -1607,7 +1626,7 @@ async def hpc_get_history_job_detail(
     finally:
         conn.close()
 
-    return result
+    return _enrich_auth_error(result, username)
 
 
 @mcp.tool()
@@ -1842,7 +1861,7 @@ async def hpc_list_history_jobs(
     finally:
         conn.close()
 
-    return result
+    return _enrich_auth_error(result, username)
 
 
 @mcp.tool()
@@ -2042,7 +2061,7 @@ async def hpc_list_running_jobs(
     finally:
         conn.close()
 
-    return result
+    return _enrich_auth_error(result, username)
 
 
 @mcp.tool()
@@ -2189,7 +2208,7 @@ async def hpc_cancel_job(
     finally:
         conn.close()
 
-    return result
+    return _enrich_auth_error(result, username)
 
 
 @mcp.tool()
@@ -2367,7 +2386,7 @@ async def efile_list_files(
     finally:
         conn2.close()
 
-    return result
+    return _enrich_auth_error(result, username)
 
 
 @mcp.tool()
@@ -2462,7 +2481,7 @@ async def efile_touch(
     finally:
         conn2.close()
 
-    return result
+    return _enrich_auth_error(result, username)
 
 
 @mcp.tool()
@@ -2565,7 +2584,7 @@ async def efile_check_permission(
     finally:
         conn2.close()
 
-    return result
+    return _enrich_auth_error(result, username)
 
 
 @mcp.tool()
@@ -2668,7 +2687,7 @@ async def efile_move(
     finally:
         conn2.close()
 
-    return result
+    return _enrich_auth_error(result, username)
 
 
 @mcp.tool()
@@ -2771,7 +2790,7 @@ async def efile_copy(
     finally:
         conn2.close()
 
-    return result
+    return _enrich_auth_error(result, username)
 
 
 @mcp.tool()
@@ -2868,7 +2887,7 @@ async def efile_rename(
     finally:
         conn2.close()
 
-    return result
+    return _enrich_auth_error(result, username)
 
 
 @mcp.tool()
@@ -2965,7 +2984,7 @@ async def efile_delete(
     finally:
         conn2.close()
 
-    return result
+    return _enrich_auth_error(result, username)
 
 
 @mcp.tool()
@@ -3060,7 +3079,7 @@ async def efile_exist(
     finally:
         conn2.close()
 
-    return result
+    return _enrich_auth_error(result, username)
 
 
 @mcp.tool()
@@ -3157,7 +3176,7 @@ async def efile_folder_create(
     finally:
         conn2.close()
 
-    return result
+    return _enrich_auth_error(result, username)
 
 
 @mcp.tool()
@@ -3260,7 +3279,7 @@ async def efile_preview_file(
     finally:
         conn2.close()
 
-    return result
+    return _enrich_auth_error(result, username)
 
 
 @mcp.tool()
@@ -3368,7 +3387,7 @@ async def efile_upload(
     finally:
         conn2.close()
 
-    return result
+    return _enrich_auth_error(result, username)
 
 
 @mcp.tool()
@@ -3492,7 +3511,7 @@ async def efile_download(
     finally:
         conn2.close()
 
-    return result
+    return _enrich_auth_error(result, username)
 
 
 # ---------------------------------------------------------------------------
@@ -3567,7 +3586,7 @@ async def notebook_list_resources(
     finally:
         conn.close()
 
-    return result
+    return _enrich_auth_error(result, username)
 
 
 @mcp.tool()
@@ -3670,7 +3689,7 @@ async def notebook_create(
     finally:
         conn.close()
 
-    return result
+    return _enrich_auth_error(result, username)
 
 
 @mcp.tool()
@@ -3733,7 +3752,7 @@ async def notebook_start(
     finally:
         conn.close()
 
-    return result
+    return _enrich_auth_error(result, username)
 
 
 @mcp.tool()
@@ -3842,7 +3861,7 @@ async def notebook_list(
     finally:
         conn2.close()
 
-    return result
+    return _enrich_auth_error(result, username)
 
 
 @mcp.tool()
@@ -3940,7 +3959,7 @@ async def notebook_detail(
     finally:
         conn2.close()
 
-    return result
+    return _enrich_auth_error(result, username)
 
 
 @mcp.tool()
@@ -4040,7 +4059,7 @@ async def notebook_stop(
     finally:
         conn2.close()
 
-    return result
+    return _enrich_auth_error(result, username)
 
 
 @mcp.tool()
@@ -4138,7 +4157,7 @@ async def notebook_release(
     finally:
         conn2.close()
 
-    return result
+    return _enrich_auth_error(result, username)
 
 
 @mcp.tool()
@@ -4240,7 +4259,7 @@ async def notebook_rename(
     finally:
         conn2.close()
 
-    return result
+    return _enrich_auth_error(result, username)
 
 
 @mcp.tool()
@@ -4365,7 +4384,7 @@ async def notebook_list_images(
     finally:
         conn2.close()
 
-    return result
+    return _enrich_auth_error(result, username)
 
 
 @mcp.tool()
@@ -4469,7 +4488,7 @@ async def notebook_list_model_images(
     finally:
         conn2.close()
 
-    return result
+    return _enrich_auth_error(result, username)
 
 
 @mcp.tool()
@@ -4567,7 +4586,7 @@ async def notebook_query_jupyter_url(
     finally:
         conn2.close()
 
-    return result
+    return _enrich_auth_error(result, username)
 
 
 @mcp.tool()
@@ -4665,7 +4684,7 @@ async def notebook_query_custom_service_url(
     finally:
         conn2.close()
 
-    return result
+    return _enrich_auth_error(result, username)
 
 
 @mcp.tool()
@@ -4774,7 +4793,7 @@ async def notebook_start_custom_service(
     finally:
         conn2.close()
 
-    return result
+    return _enrich_auth_error(result, username)
 
 
 # ---------------------------------------------------------------------------
