@@ -849,6 +849,11 @@ def _build_return_schema(data: Any) -> dict | None:
 
 @mcp.tool()
 async def get_user_info() -> dict:
+    """获取当前用户的 SCNet 账号信息。
+
+    返回国家、语言、时区、账号状态、余额等基本信息。
+    调用前需先通过 /auth/{username} 完成 AK/SK 认证。
+    """
     username = get_current_username()
 
     auth_result = check_auth(username)
@@ -1023,7 +1028,7 @@ async def hpc_list_available_partitions() -> list[dict]:
     finally:
         conn.close()
 
-    return results
+    return _enrich_auth_error(results, username)
 
 
 @mcp.tool()
