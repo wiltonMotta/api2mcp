@@ -1,8 +1,8 @@
-# list_available_partitions
+# hpc_hpc_list_available_partitions
 
 ## 需求
 
-实现一个 MCP tool `list_available_partitions`，列出当前用户在所有集群中真正可用的队列分区，过滤掉无可用资源的队列和无队列的集群。
+实现一个 MCP tool `hpc_hpc_list_available_partitions`，列出当前用户在所有集群中真正可用的队列分区，过滤掉无可用资源的队列和无队列的集群。
 
 ## 认证
 
@@ -49,7 +49,7 @@
 ## 自动注册
 
 - 从结果第一条数据通过 `_build_return_schema()` 自动生成返回 schema
-- 将工具描述文档写入 `APIs` 表（`INSERT OR REPLACE`），name 为 `list_available_partitions`
+- 将工具描述文档写入 `APIs` 表（`INSERT OR REPLACE`），name 为 `hpc_hpc_list_available_partitions`
 
 ## 设计原则
 
@@ -58,4 +58,4 @@
 
 ## 代码位置
 
-`main.py` 中 `@mcp.tool()` 装饰的 `list_available_partitions` 函数。
+`main.py` 中 `@mcp.tool()` 装饰的 `hpc_hpc_list_available_partitions` 函数。
