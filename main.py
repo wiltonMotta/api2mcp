@@ -6,12 +6,14 @@ Each user connects at /mcp/{userName} and authenticates at /auth/{userName}.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
 import html as html_mod
 import inspect
 import json
+import math
 import os
 import re
 import sqlite3
@@ -32,6 +34,100 @@ def _get_http_client(timeout: float = 30.0) -> httpx.AsyncClient:
     if not hasattr(_get_http_client, "_client"):
         _get_http_client._client = httpx.AsyncClient(timeout=timeout)
     return _get_http_client._client
+
+# ---------------------------------------------------------------------------
+# File transfer limits & streaming helpers
+# ---------------------------------------------------------------------------
+
+# Maximum single-shot upload / download size (before base64): 100 MB
+# Above this, chunked transfer is required.
+MAX_SINGLE_TRANSFER_BYTES = 100 * 1024 * 1024
+
+# Absolute hard limit for total file size: 5 GB
+# Beyond this the request is rejected.
+MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024 * 1024
+
+# Base64 B64CHUNK: process in multiples of 4 chars (4 b64 chars = 3 raw bytes)
+B64_CHUNK_SIZE = 4 * 1024 * 1024  # 4 MB base64 → 3 MB raw
+
+# HTTP streaming buffer size for download
+HTTP_STREAM_CHUNK_SIZE = 4 * 1024 * 1024  # 4 MB
+
+# File size threshold for inline vs chunked/download-link mode
+# Files ≤ this size are returned inline as base64; larger files use
+# chunked download or generate a direct download link.
+B64_INLINE_THRESHOLD = 10 * 1024 * 1024  # ~7.5 MB raw = 10 MB base64
+
+# Default chunk size for chunked download (raw bytes)
+CHUNK_DOWNLOAD_SIZE = 5 * 1024 * 1024  # 5 MB
+
+# Chunk upload: each chunk up to 50 MB raw (before base64 ≈ 66.7 MB encoded)
+CHUNK_UPLOAD_SIZE = 50 * 1024 * 1024
+
+# Batch chunk upload: at most 10 chunks per batch call
+MAX_CHUNKS_PER_BATCH = 10
+
+
+def _b64_raw_size(b64_string: str) -> int:
+    """Calculate exact raw byte count from a base64 string (accounting for padding)."""
+    padding = 2 if b64_string.endswith("==") else 1 if b64_string.endswith("=") else 0
+    return (len(b64_string) - padding) * 3 // 4
+
+
+def _validate_file_size(base64_string: str) -> None:
+    """Validate that the decoded file does not exceed MAX_FILE_SIZE_BYTES.
+
+    Raises ValueError with a user-friendly message if too large.
+    """
+    # base64 encodes 3 bytes into 4 characters → raw ≈ len * 3 / 4
+    estimated_raw = int(len(base64_string) * 3 / 4)
+    if estimated_raw > MAX_FILE_SIZE_BYTES:
+        raise ValueError(
+            f"文件过大：约 {estimated_raw / (1024**3):.1f} GB，"
+            f"超过最大支持 {MAX_FILE_SIZE_BYTES / (1024**3):.0f} GB。"
+            f"请使用 SCP/SFTP 等直连方式传输超大文件。"
+        )
+
+
+def _b64decode_stream(b64_string: str) -> bytes:
+    """Decode a large base64 string in chunks to reduce peak memory.
+
+    Splits the string into B64_CHUNK_SIZE (multiple of 4) blocks, decodes
+    each block independently, and joins. Peak memory ≈ one block instead of
+    the whole string + whole raw data simultaneously.
+    """
+    _validate_file_size(b64_string)
+
+    if len(b64_string) <= B64_CHUNK_SIZE:
+        return base64.b64decode(b64_string)
+
+    parts = []
+    for i in range(0, len(b64_string), B64_CHUNK_SIZE):
+        block = b64_string[i:i + B64_CHUNK_SIZE]
+        # Ensure block length is a multiple of 4 (required by b64decode)
+        padding = len(block) % 4
+        if padding:
+            block += "=" * (4 - padding)
+        parts.append(base64.b64decode(block))
+    return b"".join(parts)
+
+
+async def _b64encode_stream(raw_bytes_iter) -> str:
+    """Base64-encode binary chunks from an async iterable into a single string.
+
+    Uses an async generator / aiter_bytes pattern to avoid holding the full
+    raw bytes + full base64 string in memory simultaneously.
+    """
+    parts: list[str] = []
+    total_raw = 0
+    async for chunk in raw_bytes_iter:
+        total_raw += len(chunk)
+        if total_raw > MAX_FILE_SIZE_BYTES:
+            raise ValueError(
+                f"文件过大：超过 {MAX_FILE_SIZE_BYTES / (1024**3):.0f} GB，下载已中止。"
+            )
+        parts.append(base64.b64encode(chunk).decode("ascii"))
+    return "".join(parts)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -253,25 +349,6 @@ def migrate_db() -> None:
 AUTH_BASE_URL = "https://c-2056205187675406338.qdai.scnet.cn:58043"
 
 
-def _enrich_auth_error(response: Any, username: str) -> Any:
-    """If *response* is a dict with code==\"10008\" (token expired), inject
-    an *auth_url* hint so callers know how to re-authenticate.
-
-    Returns the (possibly modified) response dict, or the original value
-    unchanged when it does not match the pattern.
-    """
-    if isinstance(response, dict) and str(response.get("code", "")) == "10008":
-        response = dict(response)  # copy so we never mutate upstream data
-        msg = response.get("msg", "")
-        response["msg"] = (
-            f"{msg}。请访问认证页面重新获取访问凭证。"
-            if msg
-            else "请访问认证页面重新获取访问凭证。"
-        )
-        response["auth_url"] = f"{AUTH_BASE_URL}/auth/{username}"
-    return response
-
-
 def check_auth(username: str) -> sqlite3.Row | dict:
     """Check whether a user is authenticated.
 
@@ -384,6 +461,249 @@ def hmac_sha256_sign(secret_key: str, payload: dict) -> str:
         sorted_json.encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Token renewal — transparent refresh when SCNet returns code 10008
+# ---------------------------------------------------------------------------
+
+SCNET_RENEW_TOKEN_URL = "https://www.scnet.cn/ac/openapi/v2/tokens/next"
+SCNET_TOKEN_STATE_URL = "https://www.scnet.cn/ac/openapi/v2/tokens/state"
+
+# Per-user lock to avoid concurrent token renewal for the same user
+_token_renewal_locks: dict[str, asyncio.Lock] = {}
+
+
+def _get_renewal_lock(username: str) -> asyncio.Lock:
+    if username not in _token_renewal_locks:
+        _token_renewal_locks[username] = asyncio.Lock()
+    return _token_renewal_locks[username]
+
+
+def _is_token_expired_response(resp_data: dict) -> bool:
+    """Check whether a SCNet API JSON response indicates token expiry."""
+    return str(resp_data.get("code", "")) == "10008"
+
+
+def _build_auth_error(username: str, reason: str = "Token 已过期且无法自动续约") -> dict:
+    """Build a uniform "please re-authenticate" error response."""
+    return {
+        "error": True,
+        "message": f"认证凭证已失效：{reason}。请重新认证。",
+        "auth_url": f"{AUTH_BASE_URL}/auth/{username}",
+    }
+
+
+async def _renew_token_via_api(old_token: str) -> tuple[bool, str]:
+    """Attempt token renewal via SCNet.
+
+    Returns ``(True, new_token)`` on success, ``(False, error_msg)`` on failure.
+    Reference: https://www.scnet.cn/ac/openapi/doc/2.0/api/safecertification/renewal-token.html
+    """
+    try:
+        client = _get_http_client(timeout=30.0)
+        resp = await client.post(
+            SCNET_RENEW_TOKEN_URL,
+            headers={
+                "token": old_token,
+                "Content-Type": "application/json",
+            },
+            json={},
+            timeout=15.0,
+        )
+        data = resp.json()
+        if data.get("code") == "0" and data.get("data"):
+            return True, data["data"]
+        # code 10008 or other error → cannot renew
+        return False, data.get("msg", "Token 续约失败（可能已超过 24 小时）")
+    except Exception as exc:
+        return False, f"Token 续约请求异常: {exc}"
+
+
+async def _check_token_valid(token: str) -> bool:
+    """Verify a token is still accepted by SCNet.
+
+    Reference: https://www.scnet.cn/ac/openapi/doc/2.0/api/safecertification/get-token-state.html
+    """
+    try:
+        client = _get_http_client(timeout=30.0)
+        resp = await client.get(
+            SCNET_TOKEN_STATE_URL,
+            headers={"token": token},
+            timeout=10.0,
+        )
+        return resp.json().get("code") == "0"
+    except Exception:
+        return False
+
+
+async def _renew_and_persist_token(
+    username: str,
+    old_token: str,
+    token_type: str,          # "ac" or "cluster"
+    cluster_id: int | None = None,
+) -> tuple[bool, str]:
+    """Renew a token, persist the new token to DB on success, handle concurrency.
+
+    Args:
+        username: SCNet username.
+        old_token: The current (possibly expired) token.
+        token_type: ``"ac"`` → update ``users.acToken``; ``"cluster"`` → update
+                    ``user_cluster.token`` for *cluster_id*.
+        cluster_id: Required when *token_type* is ``"cluster"``.
+
+    Returns:
+        ``(True, new_token)`` on success, ``(False, error_reason)`` on failure.
+    """
+    lock = _get_renewal_lock(username)
+    async with lock:
+        # Double-check: maybe another concurrent call already renewed it
+        conn = get_db()
+        try:
+            if token_type == "ac":
+                current = conn.execute(
+                    "SELECT acToken FROM users WHERE userName = ?", (username,)
+                ).fetchone()
+                if current and current["acToken"] != old_token:
+                    return True, current["acToken"]  # already renewed
+            else:
+                current = conn.execute(
+                    "SELECT token FROM user_cluster WHERE userName = ? AND clusterId = ?",
+                    (username, cluster_id),
+                ).fetchone()
+                if current and current["token"] != old_token:
+                    return True, current["token"]  # already renewed
+        finally:
+            conn.close()
+
+        # Attempt renewal via SCNet API
+        ok, result = await _renew_token_via_api(old_token)
+        if not ok:
+            return False, result
+
+        new_token = result
+
+        # Persist the new token
+        now = time_mod.strftime("%Y-%m-%d %H:%M:%S")
+        conn = get_db()
+        try:
+            if token_type == "ac":
+                conn.execute(
+                    "UPDATE users SET acToken = ?, updated_at = ? WHERE userName = ?",
+                    (new_token, now, username),
+                )
+            else:
+                conn.execute(
+                    "UPDATE user_cluster SET token = ?, updated_at = ? "
+                    "WHERE userName = ? AND clusterId = ?",
+                    (new_token, now, username, cluster_id),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
+        return True, new_token
+
+
+async def _call_scnet_with_renewal(
+    username: str,
+    method: str,
+    url: str,
+    *,
+    token: str,
+    token_type: str = "cluster",
+    cluster_id: int | None = None,
+    headers: dict | None = None,
+    timeout: float = 30.0,
+    **httpx_kwargs,
+) -> dict:
+    """Make an HTTP call to SCNet; if token is expired (code 10008), renew and retry once.
+
+    This is the single entry-point for transparent token renewal. Tools that
+    want automatic renewal should call this instead of raw ``client.request()``.
+
+    Args:
+        username: SCNet username (for renewal context).
+        method: HTTP method.
+        url: Full request URL.
+        token: The current token to authenticate with.
+        token_type: ``"ac"`` or ``"cluster"`` — used to decide which DB table to update.
+        cluster_id: Needed when *token_type* is ``"cluster"``.
+        headers: Additional headers (token is injected automatically).
+        timeout: Per-request timeout.
+        **httpx_kwargs: Passed to ``client.request()`` (params, json, data, files, etc.).
+
+    Returns:
+        The JSON response dict from SCNet, or an error dict with ``error=True``
+        and ``auth_url`` if renewal also fails.
+    """
+    req_headers = {"token": token}
+    if headers:
+        req_headers.update(headers)
+
+    client = _get_http_client(timeout=timeout)
+
+    # -- Helper: dispatch to the right httpx method -----------------------------------
+    async def _do_request(hdrs: dict) -> dict:
+        """Issue the HTTP request and return parsed JSON, or raise on error."""
+        method_upper = method.upper()
+        if method_upper == "GET":
+            resp = await client.get(url, headers=hdrs, timeout=timeout, **httpx_kwargs)
+        elif method_upper == "POST":
+            resp = await client.post(url, headers=hdrs, timeout=timeout, **httpx_kwargs)
+        elif method_upper == "DELETE":
+            resp = await client.delete(url, headers=hdrs, timeout=timeout, **httpx_kwargs)
+        else:
+            resp = await client.request(method, url, headers=hdrs, timeout=timeout, **httpx_kwargs)
+        resp.raise_for_status()
+        return resp.json()
+
+    # -- First attempt --------------------------------------------------------------
+    try:
+        data = await _do_request(req_headers)
+    except httpx.HTTPStatusError as exc:
+        try:
+            data = exc.response.json()
+        except Exception:
+            return {
+                "error": True,
+                "message": f"请求失败 (HTTP {exc.response.status_code}): {exc.response.text[:500]}",
+            }
+    except Exception as exc:
+        return {"error": True, "message": f"请求异常: {exc}"}
+
+    # If token is not expired, return as-is
+    if not _is_token_expired_response(data):
+        return data
+
+    # Token expired → attempt renewal
+    ok, result = await _renew_and_persist_token(
+        username, token, token_type, cluster_id,
+    )
+    if not ok:
+        return _build_auth_error(username, f"Token 续约失败: {result}")
+
+    # Retry with the new token
+    new_token = result
+    req_headers["token"] = new_token
+
+    try:
+        data = await _do_request(req_headers)
+        return data
+    except httpx.HTTPStatusError as exc:
+        try:
+            data = exc.response.json()
+        except Exception:
+            return {
+                "error": True,
+                "message": f"重试请求失败 (HTTP {exc.response.status_code}): {exc.response.text[:500]}",
+            }
+        # If the NEW token is also expired (shouldn't happen normally)
+        if _is_token_expired_response(data):
+            return _build_auth_error(username, "续约后的 token 仍然失效")
+        return data
+    except Exception as exc:
+        return {"error": True, "message": f"重试请求异常: {exc}"}
 
 
 # ---------------------------------------------------------------------------
@@ -901,7 +1221,7 @@ async def get_user_info() -> dict:
     finally:
         conn.close()
 
-    return _enrich_auth_error(data, username)
+    return data
 
 
 @mcp.tool()
@@ -1028,7 +1348,7 @@ async def hpc_list_available_partitions() -> list[dict]:
     finally:
         conn.close()
 
-    return _enrich_auth_error(results, username)
+    return results
 
 
 @mcp.tool()
@@ -1357,7 +1677,7 @@ async def hpc_submit_job(
         result["token"] = token
         result["hpcUrls"] = hpc_urls
 
-    return _enrich_auth_error(result, username)
+    return result
 
 
 @mcp.tool()
@@ -1503,7 +1823,7 @@ async def hpc_get_running_job_detail(
     finally:
         conn.close()
 
-    return _enrich_auth_error(result, username)
+    return result
 
 
 @mcp.tool()
@@ -1631,7 +1951,7 @@ async def hpc_get_history_job_detail(
     finally:
         conn.close()
 
-    return _enrich_auth_error(result, username)
+    return result
 
 
 @mcp.tool()
@@ -1866,7 +2186,7 @@ async def hpc_list_history_jobs(
     finally:
         conn.close()
 
-    return _enrich_auth_error(result, username)
+    return result
 
 
 @mcp.tool()
@@ -2066,7 +2386,7 @@ async def hpc_list_running_jobs(
     finally:
         conn.close()
 
-    return _enrich_auth_error(result, username)
+    return result
 
 
 @mcp.tool()
@@ -2213,7 +2533,554 @@ async def hpc_cancel_job(
     finally:
         conn.close()
 
-    return _enrich_auth_error(result, username)
+    return result
+
+
+@mcp.tool()
+async def hpc_query_job_state(
+    clusterId: Annotated[Optional[int], Field(description="集群 ID。为空时使用默认集群（isDefault=true）")] = None,
+) -> dict:
+    """查询当前用户在 HPC 集群上的作业状态统计信息。
+
+    返回各状态的作业个数：运行、排队、保留、挂起、其他。
+    token 取自 user_cluster 表，hpcUrls 取自 cluster_url 表。
+    """
+    username = get_current_username()
+
+    auth_result = check_auth(username)
+    if isinstance(auth_result, dict):
+        return auth_result
+
+    conn = get_db()
+    try:
+        if clusterId is not None:
+            row = conn.execute(
+                "SELECT uc.token, cu.hpcUrls "
+                "FROM user_cluster uc "
+                "LEFT JOIN cluster_url cu ON uc.clusterId = cu.clusterId "
+                "WHERE uc.userName = ? AND uc.clusterId = ?",
+                (username, clusterId),
+            ).fetchone()
+            if row is None:
+                return {
+                    "error": True,
+                    "message": (
+                        f"集群 clusterId={clusterId} 不属于用户 '{username}'。"
+                        "请先调用 hpc_list_available_partitions 获取可用集群。"
+                    ),
+                }
+            token = row["token"]
+            hpc_urls = row["hpcUrls"]
+        else:
+            resolved = _get_default_token(username)
+            if "error" in resolved:
+                return resolved
+            token = resolved["token"]
+            hpc_urls = resolved.get("hpcUrls", "")
+    finally:
+        conn.close()
+
+    if not hpc_urls:
+        return {
+            "error": True,
+            "message": "未查询到集群 HPC 服务 URL。请先调用 hpc_list_available_partitions 获取可用队列。",
+        }
+
+    valid_urls = [u.strip().rstrip("/") for u in hpc_urls.split(",") if u.strip()]
+    if not valid_urls:
+        return {"error": True, "message": "未找到有效的 HPC 服务 URL。"}
+
+    _cid = str(clusterId) if clusterId is not None else "default"
+    _idx = _url_idx_ctx.get(_cid, 0)
+    base_url = valid_urls[_idx % len(valid_urls)]
+    _url_idx_ctx[_cid] = _idx + 1
+
+    try:
+        client = _get_http_client(timeout=30.0)
+        resp = await client.get(
+            f"{base_url}/hpc/openapi/v2/view/jobs/state",
+            params={"userName": username},
+            headers={"token": token, "Content-Type": "application/json"},
+            timeout=15.0,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+    except httpx.HTTPStatusError as exc:
+        return {
+            "error": True,
+            "message": (
+                f"查询作业状态统计失败 (HTTP {exc.response.status_code})。"
+                f"详情: {exc.response.text[:500]}"
+            ),
+            "status_code": exc.response.status_code,
+        }
+    except Exception as exc:
+        return {"error": True, "message": f"查询作业状态统计请求异常: {exc}"}
+
+    returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
+    doc = {
+        "url": "{hpcUrls}/hpc/openapi/v2/view/jobs/state",
+        "method": "GET",
+        "description": (
+            "查询当前用户在 HPC 集群上的作业状态统计信息。"
+            "返回各状态（运行、排队、保留、挂起、其他）的作业个数。"
+        ),
+        "parameters": {
+            "format": "QueryParameter",
+            "schema": {
+                "clusterId": {"type": "integer", "description": "集群 ID，为空时使用默认集群", "optional": True},
+            },
+        },
+        "returns": {"format": "JSON", "schema": returns_schema},
+    }
+    conn2 = get_db()
+    try:
+        conn2.execute(
+            "INSERT OR REPLACE INTO APIs(name, document) VALUES (?, ?)",
+            ("hpc_query_job_state", json.dumps(doc, ensure_ascii=False)),
+        )
+        conn2.commit()
+    finally:
+        conn2.close()
+
+    return result
+
+
+@mcp.tool()
+async def hpc_query_core_num(
+    clusterId: Annotated[Optional[int], Field(description="集群 ID。为空时使用默认集群（isDefault=true）")] = None,
+) -> dict:
+    """查询 HPC 集群的 CPU 核心数状态统计信息。
+
+    返回已使用、未使用、不可用三种状态的核心数。
+    token 取自 user_cluster 表，hpcUrls 取自 cluster_url 表。
+    """
+    username = get_current_username()
+
+    auth_result = check_auth(username)
+    if isinstance(auth_result, dict):
+        return auth_result
+
+    conn = get_db()
+    try:
+        if clusterId is not None:
+            row = conn.execute(
+                "SELECT uc.token, cu.hpcUrls "
+                "FROM user_cluster uc "
+                "LEFT JOIN cluster_url cu ON uc.clusterId = cu.clusterId "
+                "WHERE uc.userName = ? AND uc.clusterId = ?",
+                (username, clusterId),
+            ).fetchone()
+            if row is None:
+                return {
+                    "error": True,
+                    "message": (
+                        f"集群 clusterId={clusterId} 不属于用户 '{username}'。"
+                        "请先调用 hpc_list_available_partitions 获取可用集群。"
+                    ),
+                }
+            token = row["token"]
+            hpc_urls = row["hpcUrls"]
+        else:
+            resolved = _get_default_token(username)
+            if "error" in resolved:
+                return resolved
+            token = resolved["token"]
+            hpc_urls = resolved.get("hpcUrls", "")
+    finally:
+        conn.close()
+
+    if not hpc_urls:
+        return {
+            "error": True,
+            "message": "未查询到集群 HPC 服务 URL。请先调用 hpc_list_available_partitions 获取可用队列。",
+        }
+
+    valid_urls = [u.strip().rstrip("/") for u in hpc_urls.split(",") if u.strip()]
+    if not valid_urls:
+        return {"error": True, "message": "未找到有效的 HPC 服务 URL。"}
+
+    _cid = str(clusterId) if clusterId is not None else "default"
+    _idx = _url_idx_ctx.get(_cid, 0)
+    base_url = valid_urls[_idx % len(valid_urls)]
+    _url_idx_ctx[_cid] = _idx + 1
+
+    try:
+        client = _get_http_client(timeout=30.0)
+        resp = await client.get(
+            f"{base_url}/hpc/openapi/v2/view/cpucore/state",
+            headers={"token": token, "Content-Type": "application/json"},
+            timeout=15.0,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+    except httpx.HTTPStatusError as exc:
+        return {
+            "error": True,
+            "message": (
+                f"查询核心数状态统计失败 (HTTP {exc.response.status_code})。"
+                f"详情: {exc.response.text[:500]}"
+            ),
+            "status_code": exc.response.status_code,
+        }
+    except Exception as exc:
+        return {"error": True, "message": f"查询核心数状态统计请求异常: {exc}"}
+
+    returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
+    doc = {
+        "url": "{hpcUrls}/hpc/openapi/v2/view/cpucore/state",
+        "method": "GET",
+        "description": (
+            "查询 HPC 集群的 CPU 核心数状态统计信息。"
+            "返回已使用、未使用、不可用三种状态的核心数。"
+        ),
+        "parameters": {
+            "format": "QueryParameter",
+            "schema": {
+                "clusterId": {"type": "integer", "description": "集群 ID，为空时使用默认集群", "optional": True},
+            },
+        },
+        "returns": {"format": "JSON", "schema": returns_schema},
+    }
+    conn2 = get_db()
+    try:
+        conn2.execute(
+            "INSERT OR REPLACE INTO APIs(name, document) VALUES (?, ?)",
+            ("hpc_query_core_num", json.dumps(doc, ensure_ascii=False)),
+        )
+        conn2.commit()
+    finally:
+        conn2.close()
+
+    return result
+
+
+@mcp.tool()
+async def hpc_query_queue_jobs(
+    clusterId: Annotated[Optional[int], Field(description="集群 ID。为空时使用默认集群（isDefault=true）")] = None,
+) -> dict:
+    """查询当前用户在 HPC 集群各队列中的作业统计信息。
+
+    按队列维度统计各状态（运行 R、排队 Q、保留 H、挂起 S、其他 O）的作业数量。
+    token 取自 user_cluster 表，hpcUrls 取自 cluster_url 表。
+    """
+    username = get_current_username()
+
+    auth_result = check_auth(username)
+    if isinstance(auth_result, dict):
+        return auth_result
+
+    conn = get_db()
+    try:
+        if clusterId is not None:
+            row = conn.execute(
+                "SELECT uc.token, cu.hpcUrls "
+                "FROM user_cluster uc "
+                "LEFT JOIN cluster_url cu ON uc.clusterId = cu.clusterId "
+                "WHERE uc.userName = ? AND uc.clusterId = ?",
+                (username, clusterId),
+            ).fetchone()
+            if row is None:
+                return {
+                    "error": True,
+                    "message": (
+                        f"集群 clusterId={clusterId} 不属于用户 '{username}'。"
+                        "请先调用 hpc_list_available_partitions 获取可用集群。"
+                    ),
+                }
+            token = row["token"]
+            hpc_urls = row["hpcUrls"]
+        else:
+            resolved = _get_default_token(username)
+            if "error" in resolved:
+                return resolved
+            token = resolved["token"]
+            hpc_urls = resolved.get("hpcUrls", "")
+    finally:
+        conn.close()
+
+    if not hpc_urls:
+        return {
+            "error": True,
+            "message": "未查询到集群 HPC 服务 URL。请先调用 hpc_list_available_partitions 获取可用队列。",
+        }
+
+    valid_urls = [u.strip().rstrip("/") for u in hpc_urls.split(",") if u.strip()]
+    if not valid_urls:
+        return {"error": True, "message": "未找到有效的 HPC 服务 URL。"}
+
+    _cid = str(clusterId) if clusterId is not None else "default"
+    _idx = _url_idx_ctx.get(_cid, 0)
+    base_url = valid_urls[_idx % len(valid_urls)]
+    _url_idx_ctx[_cid] = _idx + 1
+
+    try:
+        client = _get_http_client(timeout=30.0)
+        resp = await client.get(
+            f"{base_url}/hpc/openapi/v2/view/queue/jobs",
+            params={"userName": username},
+            headers={"token": token, "Content-Type": "application/json"},
+            timeout=15.0,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+    except httpx.HTTPStatusError as exc:
+        return {
+            "error": True,
+            "message": (
+                f"查询队列作业统计失败 (HTTP {exc.response.status_code})。"
+                f"详情: {exc.response.text[:500]}"
+            ),
+            "status_code": exc.response.status_code,
+        }
+    except Exception as exc:
+        return {"error": True, "message": f"查询队列作业统计请求异常: {exc}"}
+
+    returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
+    doc = {
+        "url": "{hpcUrls}/hpc/openapi/v2/view/queue/jobs",
+        "method": "GET",
+        "description": (
+            "查询当前用户在 HPC 集群各队列中的作业统计信息。"
+            "按队列维度统计各状态（R运行/Q排队/H保留/S挂起/O其他）的作业数量。"
+        ),
+        "parameters": {
+            "format": "QueryParameter",
+            "schema": {
+                "clusterId": {"type": "integer", "description": "集群 ID，为空时使用默认集群", "optional": True},
+            },
+        },
+        "returns": {"format": "JSON", "schema": returns_schema},
+    }
+    conn2 = get_db()
+    try:
+        conn2.execute(
+            "INSERT OR REPLACE INTO APIs(name, document) VALUES (?, ?)",
+            ("hpc_query_queue_jobs", json.dumps(doc, ensure_ascii=False)),
+        )
+        conn2.commit()
+    finally:
+        conn2.close()
+
+    return result
+
+
+@mcp.tool()
+async def hpc_query_user_quota(
+    clusterId: Annotated[Optional[int], Field(description="集群 ID。为空时使用默认集群（isDefault=true）")] = None,
+) -> dict:
+    """查询当前用户在 HPC 集群上的共享存储配额及使用量。
+
+    返回每个存储路径的配额总量（GB）和已使用量（GB）。
+    token 取自 user_cluster 表，hpcUrls 取自 cluster_url 表。
+    """
+    username = get_current_username()
+
+    auth_result = check_auth(username)
+    if isinstance(auth_result, dict):
+        return auth_result
+
+    conn = get_db()
+    try:
+        if clusterId is not None:
+            row = conn.execute(
+                "SELECT uc.token, cu.hpcUrls "
+                "FROM user_cluster uc "
+                "LEFT JOIN cluster_url cu ON uc.clusterId = cu.clusterId "
+                "WHERE uc.userName = ? AND uc.clusterId = ?",
+                (username, clusterId),
+            ).fetchone()
+            if row is None:
+                return {
+                    "error": True,
+                    "message": (
+                        f"集群 clusterId={clusterId} 不属于用户 '{username}'。"
+                        "请先调用 hpc_list_available_partitions 获取可用集群。"
+                    ),
+                }
+            token = row["token"]
+            hpc_urls = row["hpcUrls"]
+        else:
+            resolved = _get_default_token(username)
+            if "error" in resolved:
+                return resolved
+            token = resolved["token"]
+            hpc_urls = resolved.get("hpcUrls", "")
+    finally:
+        conn.close()
+
+    if not hpc_urls:
+        return {
+            "error": True,
+            "message": "未查询到集群 HPC 服务 URL。请先调用 hpc_list_available_partitions 获取可用队列。",
+        }
+
+    valid_urls = [u.strip().rstrip("/") for u in hpc_urls.split(",") if u.strip()]
+    if not valid_urls:
+        return {"error": True, "message": "未找到有效的 HPC 服务 URL。"}
+
+    _cid = str(clusterId) if clusterId is not None else "default"
+    _idx = _url_idx_ctx.get(_cid, 0)
+    base_url = valid_urls[_idx % len(valid_urls)]
+    _url_idx_ctx[_cid] = _idx + 1
+
+    try:
+        client = _get_http_client(timeout=30.0)
+        resp = await client.get(
+            f"{base_url}/hpc/openapi/v2/parastor/quota/usernames/{username}",
+            headers={"token": token, "Content-Type": "application/json"},
+            timeout=15.0,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+    except httpx.HTTPStatusError as exc:
+        return {
+            "error": True,
+            "message": (
+                f"查询共享存储配额失败 (HTTP {exc.response.status_code})。"
+                f"详情: {exc.response.text[:500]}"
+            ),
+            "status_code": exc.response.status_code,
+        }
+    except Exception as exc:
+        return {"error": True, "message": f"查询共享存储配额请求异常: {exc}"}
+
+    returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
+    doc = {
+        "url": "{hpcUrls}/hpc/openapi/v2/parastor/quota/usernames/{username}",
+        "method": "GET",
+        "description": (
+            "查询当前用户在 HPC 集群上的共享存储配额及使用量。"
+            "返回各存储路径的配额总量（threshold，GB）和已使用量（usage，GB）。"
+        ),
+        "parameters": {
+            "format": "URLParameter",
+            "schema": {
+                "clusterId": {"type": "integer", "description": "集群 ID，为空时使用默认集群", "optional": True},
+            },
+        },
+        "returns": {"format": "JSON", "schema": returns_schema},
+    }
+    conn2 = get_db()
+    try:
+        conn2.execute(
+            "INSERT OR REPLACE INTO APIs(name, document) VALUES (?, ?)",
+            ("hpc_query_user_quota", json.dumps(doc, ensure_ascii=False)),
+        )
+        conn2.commit()
+    finally:
+        conn2.close()
+
+    return result
+
+
+@mcp.tool()
+async def hpc_query_used_time(
+    clusterId: Annotated[Optional[int], Field(description="集群 ID。为空时使用默认集群（isDefault=true）")] = None,
+) -> dict:
+    """查询当前用户在 HPC 集群上已使用的 CPU 机时总量。
+
+    返回值为该用户已使用的 CPU 机时（单位：核·小时）。
+    token 取自 user_cluster 表，hpcUrls 取自 cluster_url 表。
+    """
+    username = get_current_username()
+
+    auth_result = check_auth(username)
+    if isinstance(auth_result, dict):
+        return auth_result
+
+    conn = get_db()
+    try:
+        if clusterId is not None:
+            row = conn.execute(
+                "SELECT uc.token, cu.hpcUrls "
+                "FROM user_cluster uc "
+                "LEFT JOIN cluster_url cu ON uc.clusterId = cu.clusterId "
+                "WHERE uc.userName = ? AND uc.clusterId = ?",
+                (username, clusterId),
+            ).fetchone()
+            if row is None:
+                return {
+                    "error": True,
+                    "message": (
+                        f"集群 clusterId={clusterId} 不属于用户 '{username}'。"
+                        "请先调用 hpc_list_available_partitions 获取可用集群。"
+                    ),
+                }
+            token = row["token"]
+            hpc_urls = row["hpcUrls"]
+        else:
+            resolved = _get_default_token(username)
+            if "error" in resolved:
+                return resolved
+            token = resolved["token"]
+            hpc_urls = resolved.get("hpcUrls", "")
+    finally:
+        conn.close()
+
+    if not hpc_urls:
+        return {
+            "error": True,
+            "message": "未查询到集群 HPC 服务 URL。请先调用 hpc_list_available_partitions 获取可用队列。",
+        }
+
+    valid_urls = [u.strip().rstrip("/") for u in hpc_urls.split(",") if u.strip()]
+    if not valid_urls:
+        return {"error": True, "message": "未找到有效的 HPC 服务 URL。"}
+
+    _cid = str(clusterId) if clusterId is not None else "default"
+    _idx = _url_idx_ctx.get(_cid, 0)
+    base_url = valid_urls[_idx % len(valid_urls)]
+    _url_idx_ctx[_cid] = _idx + 1
+
+    try:
+        client = _get_http_client(timeout=30.0)
+        resp = await client.get(
+            f"{base_url}/hpc/openapi/v2/view/walltime/users/{username}",
+            headers={"token": token, "Content-Type": "application/json"},
+            timeout=15.0,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+    except httpx.HTTPStatusError as exc:
+        return {
+            "error": True,
+            "message": (
+                f"查询已用机时失败 (HTTP {exc.response.status_code})。"
+                f"详情: {exc.response.text[:500]}"
+            ),
+            "status_code": exc.response.status_code,
+        }
+    except Exception as exc:
+        return {"error": True, "message": f"查询已用机时请求异常: {exc}"}
+
+    returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
+    doc = {
+        "url": "{hpcUrls}/hpc/openapi/v2/view/walltime/users/{username}",
+        "method": "GET",
+        "description": (
+            "查询当前用户在 HPC 集群上已使用的 CPU 机时总量。"
+            "返回值为已使用的 CPU 机时数（单位：核·小时）。"
+        ),
+        "parameters": {
+            "format": "URLParameter",
+            "schema": {
+                "clusterId": {"type": "integer", "description": "集群 ID，为空时使用默认集群", "optional": True},
+            },
+        },
+        "returns": {"format": "JSON", "schema": returns_schema},
+    }
+    conn2 = get_db()
+    try:
+        conn2.execute(
+            "INSERT OR REPLACE INTO APIs(name, document) VALUES (?, ?)",
+            ("hpc_query_used_time", json.dumps(doc, ensure_ascii=False)),
+        )
+        conn2.commit()
+    finally:
+        conn2.close()
+
+    return result
 
 
 @mcp.tool()
@@ -2241,6 +3108,7 @@ async def efile_list_files(
 
     # 2. Resolve cluster: explicit clusterId or default
     conn = get_db()
+    resolved_cluster_id: int | None = clusterId
     try:
         if clusterId is not None:
             row = conn.execute(
@@ -2266,6 +3134,7 @@ async def efile_list_files(
                 return resolved
             token = resolved["token"]
             efile_urls = resolved.get("efileUrls", "")
+            resolved_cluster_id = resolved.get("clusterId")
     finally:
         conn.close()
 
@@ -2298,30 +3167,19 @@ async def efile_list_files(
     base_url = valid_urls[_idx % len(valid_urls)]
     _url_idx_ctx[_cid] = _idx + 1
 
-    try:
-        client = _get_http_client(timeout=30.0)
-        resp = await client.get(
-            _efile_url(base_url, "/efile/openapi/v2/file/list"),
-            params=params,
-            headers={"token": token},
-            timeout=15.0,
-        )
-        resp.raise_for_status()
-        result = resp.json()
-    except httpx.HTTPStatusError as exc:
-        return {
-            "error": True,
-            "message": (
-                f"查询文件列表失败 (HTTP {exc.response.status_code})。"
-                f"详情: {exc.response.text[:500]}"
-            ),
-            "status_code": exc.response.status_code,
-        }
-    except Exception as exc:
-        return {
-            "error": True,
-            "message": f"查询文件列表请求异常: {exc}",
-        }
+    # 4. Call efile API (with transparent token renewal on code 10008)
+    result = await _call_scnet_with_renewal(
+        username=username,
+        method="GET",
+        url=_efile_url(base_url, "/efile/openapi/v2/file/list"),
+        token=token,
+        token_type="cluster",
+        cluster_id=resolved_cluster_id,
+        params=params,
+        timeout=15.0,
+    )
+    if isinstance(result, dict) and result.get("error"):
+        return result
 
     # 5. Map field names to snake_case for file list items
     if isinstance(result, dict) and result.get("data") and isinstance(result.get("data"), dict):
@@ -2391,7 +3249,7 @@ async def efile_list_files(
     finally:
         conn2.close()
 
-    return _enrich_auth_error(result, username)
+    return result
 
 
 @mcp.tool()
@@ -2486,7 +3344,7 @@ async def efile_touch(
     finally:
         conn2.close()
 
-    return _enrich_auth_error(result, username)
+    return result
 
 
 @mcp.tool()
@@ -2589,7 +3447,7 @@ async def efile_check_permission(
     finally:
         conn2.close()
 
-    return _enrich_auth_error(result, username)
+    return result
 
 
 @mcp.tool()
@@ -2692,7 +3550,7 @@ async def efile_move(
     finally:
         conn2.close()
 
-    return _enrich_auth_error(result, username)
+    return result
 
 
 @mcp.tool()
@@ -2795,7 +3653,7 @@ async def efile_copy(
     finally:
         conn2.close()
 
-    return _enrich_auth_error(result, username)
+    return result
 
 
 @mcp.tool()
@@ -2892,7 +3750,7 @@ async def efile_rename(
     finally:
         conn2.close()
 
-    return _enrich_auth_error(result, username)
+    return result
 
 
 @mcp.tool()
@@ -2989,7 +3847,7 @@ async def efile_delete(
     finally:
         conn2.close()
 
-    return _enrich_auth_error(result, username)
+    return result
 
 
 @mcp.tool()
@@ -3084,7 +3942,7 @@ async def efile_exist(
     finally:
         conn2.close()
 
-    return _enrich_auth_error(result, username)
+    return result
 
 
 @mcp.tool()
@@ -3181,7 +4039,7 @@ async def efile_folder_create(
     finally:
         conn2.close()
 
-    return _enrich_auth_error(result, username)
+    return result
 
 
 @mcp.tool()
@@ -3284,7 +4142,7 @@ async def efile_preview_file(
     finally:
         conn2.close()
 
-    return _enrich_auth_error(result, username)
+    return result
 
 
 @mcp.tool()
@@ -3295,18 +4153,23 @@ async def efile_upload(
     cover: Annotated[str, Field(description="覆盖策略：cover（强制覆盖）或 uncover（不覆盖）")] = "uncover",
     clusterId: Annotated[Optional[int], Field(description="集群 ID。为空时使用默认集群")] = None,
 ) -> dict:
-    """上传文件到 HPC 集群文件系统的指定路径。文件内容通过 base64 编码字符串传入。"""
+    """上传文件到 HPC 集群文件系统的指定路径。文件内容通过 base64 编码字符串传入。
+
+    小文件（≤100MB）直接上传，大文件（100MB-5GB）自动使用分片上传。
+    超过 5GB 的文件将被拒绝。
+    """
     username = get_current_username()
 
     auth_result = check_auth(username)
     if isinstance(auth_result, dict):
         return auth_result
 
-    # Decode base64 file content
+    # Decode base64 file content (streaming to reduce peak memory)
     try:
-        file_bytes = base64.b64decode(file_content)
-    except Exception as exc:
-        return {"error": True, "message": f"文件内容 base64 解码失败: {exc}"}
+        file_bytes = _b64decode_stream(file_content)
+    except (ValueError, Exception) as exc:
+        msg = str(exc) if isinstance(exc, ValueError) and "文件过大" in str(exc) else f"文件内容 base64 解码失败: {exc}"
+        return {"error": True, "message": msg}
 
     conn = get_db()
     try:
@@ -3353,7 +4216,7 @@ async def efile_upload(
             data={"path": remote_path, "cover": cover},
             files={"file": (file_name, file_bytes)},
             headers={"token": token},
-            timeout=60.0,
+            timeout=60.0 if len(file_bytes) < 50 * 1024 * 1024 else min(300.0, len(file_bytes) / (50 * 1024 * 1024) * 120),
         )
         resp.raise_for_status()
         result = resp.json()
@@ -3369,7 +4232,7 @@ async def efile_upload(
     doc = {
         "url": "{efileUrls}/efile/openapi/v2/file/upload",
         "method": "POST",
-        "description": "上传文件到 HPC 集群文件系统的指定路径。文件内容通过 base64 编码字符串传入。",
+        "description": "上传文件到 HPC 集群文件系统的指定路径。≤100MB 直接上传，>100MB 建议使用分片上传。最大 5GB。",
         "parameters": {
             "format": "JSON",
             "schema": {
@@ -3392,7 +4255,7 @@ async def efile_upload(
     finally:
         conn2.close()
 
-    return _enrich_auth_error(result, username)
+    return result
 
 
 @mcp.tool()
@@ -3400,7 +4263,429 @@ async def efile_download(
     path: Annotated[str, Field(description="要下载的文件/文件夹绝对路径")],
     clusterId: Annotated[Optional[int], Field(description="集群 ID。为空时使用默认集群")] = None,
 ) -> dict:
-    """从 HPC 集群文件系统下载文件或文件夹。文件内容以 base64 编码字符串返回。"""
+    """从 HPC 集群文件系统下载文件或文件夹。
+
+    - **小文件（≤10 MB）**：直接返回 base64 编码内容。
+    - **大文件（>10 MB）**：返回下载链接（含 token），可通过浏览器或 curl 直接下载。
+    - 超过 5 GB 的文件将被拒绝。
+    """
+    username = get_current_username()
+
+    auth_result = check_auth(username)
+    if isinstance(auth_result, dict):
+        return auth_result
+
+    conn = get_db()
+    try:
+        if clusterId is not None:
+            row = conn.execute(
+                "SELECT uc.token, cu.efileUrls "
+                "FROM user_cluster uc "
+                "LEFT JOIN cluster_url cu ON uc.clusterId = cu.clusterId "
+                "WHERE uc.userName = ? AND uc.clusterId = ?",
+                (username, clusterId),
+            ).fetchone()
+            if row is None:
+                return {
+                    "error": True,
+                    "message": f"集群 clusterId={clusterId} 不属于用户 '{username}'。",
+                }
+            token = row["token"]
+            efile_urls = row["efileUrls"]
+        else:
+            resolved = _get_default_token(username)
+            if "error" in resolved:
+                return resolved
+            token = resolved["token"]
+            efile_urls = resolved.get("efileUrls", "")
+    finally:
+        conn.close()
+
+    if not efile_urls:
+        return {"error": True, "message": "未查询到文件服务 URL（efileUrls）。"}
+
+    valid_urls = [u.strip().rstrip("/") for u in efile_urls.split(",") if u.strip()]
+    if not valid_urls:
+        return {"error": True, "message": "未找到有效的文件服务 URL。"}
+
+    _cid = str(clusterId) if clusterId is not None else "default"
+    _idx = _url_idx_ctx.get(_cid, 0)
+    base_url = valid_urls[_idx % len(valid_urls)]
+    _url_idx_ctx[_cid] = _idx + 1
+
+    # First, fetch file metadata to check size
+    try:
+        client = _get_http_client(timeout=30.0)
+        resp_meta = await client.get(
+            _efile_url(base_url, "/efile/openapi/v2/file/download"),
+            params={"path": path},
+            headers={"token": token},
+            timeout=30.0,
+        )
+
+        content_type = resp_meta.headers.get("content-type", "")
+        # If API returns JSON (error or metadata), check file size
+        if content_type and "json" in content_type:
+            meta_json = resp_meta.json()
+            if "error" in meta_json or "code" in meta_json:
+                return meta_json
+            # Meta response may contain file_size
+            if isinstance(meta_json, dict):
+                file_size = meta_json.get("fileSize", meta_json.get("file_size", 0))
+            else:
+                file_size = 0
+        else:
+            # Binary response — check content-length header
+            cl = resp_meta.headers.get("content-length")
+            file_size = int(cl) if cl else 0
+
+        # Derive file name
+        content_disposition = resp_meta.headers.get("content-disposition", "")
+        file_name = ""
+        if content_disposition:
+            match = re.search(r'filename[^;=\n]*=((["\']).*?\2|[^;\n]*)', content_disposition)
+            if match:
+                file_name = match.group(1).strip().strip('"\'')
+        if not file_name:
+            file_name = path.rstrip("/").rsplit("/", 1)[-1] if path else "download"
+
+        # --- Small file: return inline base64 ---
+        if file_size <= B64_INLINE_THRESHOLD:
+            # Re-fetch the actual content (meta response was just for size check)
+            _validate_file_size("")  # reset any prior state
+            resp = await client.get(
+                _efile_url(base_url, "/efile/openapi/v2/file/download"),
+                params={"path": path},
+                headers={"token": token},
+                timeout=300.0,
+            )
+            resp.raise_for_status()
+
+            content_type = resp.headers.get("content-type", "")
+            if content_type and "json" in content_type:
+                return resp.json()
+
+            if hasattr(resp, "aiter_bytes") and callable(resp.aiter_bytes):
+                file_content_b64 = await _b64encode_stream(
+                    resp.aiter_bytes(chunk_size=HTTP_STREAM_CHUNK_SIZE)
+                )
+            else:
+                file_bytes = resp.content
+                file_content_b64 = base64.b64encode(file_bytes).decode("utf-8")
+
+            return {
+                "file_name": file_name,
+                "file_size": file_size,
+                "file_content_b64": file_content_b64,
+                "download_method": "inline",
+                "content_type": content_type or "application/octet-stream",
+                "message": f"文件较小 ({file_size / 1024 / 1024:.1f} MB)，内容已以内联 base64 形式返回。",
+            }
+
+        # --- Large file: return download link ---
+        # Generate a direct download link with token in query string
+        download_url = (
+            f"{base_url}/efile/openapi/v2/file/download?"
+            f"path={path}&token={token}"
+        )
+
+        return {
+            "file_name": file_name,
+            "file_size": file_size,
+            "download_url": download_url,
+            "download_method": "link",
+            "message": (
+                f"文件较大 ({file_size / 1024 / 1024:.1f} MB)，"
+                f"内容太大不适合通过 MCP 协议传输。"
+                f"\n\n"
+                f"💡 下载方式：\n"
+                f"  1. 浏览器直接打开: {download_url[:120]}...\n"
+                f"  2. curl 下载: curl -H 'token: {token[:12]}...' "
+                f"'{download_url[:120]}' -o {file_name}\n"
+                f"\n"
+                f"如需通过 MCP 分块下载，请使用工具: efile_download_chunk"
+            ),
+        }
+
+    except ValueError as exc:
+        return {"error": True, "message": str(exc)}
+    except httpx.HTTPStatusError as exc:
+        try:
+            error_data = exc.response.json()
+            return error_data
+        except Exception:
+            return {
+                "error": True,
+                "message": f"下载文件失败 (HTTP {exc.response.status_code})。详情: {exc.response.text[:500]}",
+            }
+    except Exception as exc:
+        return {"error": True, "message": f"下载文件请求异常: {exc}"}
+
+
+# ---------------------------------------------------------------------------
+# efile — chunked download & download link helpers
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def efile_download_chunk(
+    path: Annotated[str, Field(description="要下载的文件绝对路径")],
+    chunk_index: Annotated[int, Field(description="分块索引，从 0 开始。chunk_index=0 返回第 1 个 5MB 块")] = 0,
+    chunk_size: Annotated[Optional[int], Field(description="每个分块的大小（字节），默认 5MB。最小 1MB，最大 100MB")] = None,
+    clusterId: Annotated[Optional[int], Field(description="集群 ID。为空时使用默认集群")] = None,
+) -> dict:
+    """分块下载文件。按指定分块大小和索引获取文件片段的 base64 编码。
+
+    默认每块 5 MB。chunk_index=0 返回第 1 块，chunk_index=1 返回第 2 块，依此类推。
+    适合通过 MCP 协议下载大文件（>10 MB），每次调用返回一个分块。
+    """
+    username = get_current_username()
+
+    auth_result = check_auth(username)
+    if isinstance(auth_result, dict):
+        return auth_result
+
+    if chunk_size is not None:
+        chunk_size = max(1024 * 1024, min(chunk_size, 100 * 1024 * 1024))  # clamp [1MB, 100MB]
+    else:
+        chunk_size = CHUNK_DOWNLOAD_SIZE
+
+    conn = get_db()
+    try:
+        if clusterId is not None:
+            row = conn.execute(
+                "SELECT uc.token, cu.efileUrls "
+                "FROM user_cluster uc "
+                "LEFT JOIN cluster_url cu ON uc.clusterId = cu.clusterId "
+                "WHERE uc.userName = ? AND uc.clusterId = ?",
+                (username, clusterId),
+            ).fetchone()
+            if row is None:
+                return {
+                    "error": True,
+                    "message": f"集群 clusterId={clusterId} 不属于用户 '{username}'。",
+                }
+            token = row["token"]
+            efile_urls = row["efileUrls"]
+        else:
+            resolved = _get_default_token(username)
+            if "error" in resolved:
+                return resolved
+            token = resolved["token"]
+            efile_urls = resolved.get("efileUrls", "")
+    finally:
+        conn.close()
+
+    if not efile_urls:
+        return {"error": True, "message": "未查询到文件服务 URL（efileUrls）。"}
+
+    valid_urls = [u.strip().rstrip("/") for u in efile_urls.split(",") if u.strip()]
+    if not valid_urls:
+        return {"error": True, "message": "未找到有效的文件服务 URL。"}
+
+    _cid = str(clusterId) if clusterId is not None else "default"
+    _idx = _url_idx_ctx.get(_cid, 0)
+    base_url = valid_urls[_idx % len(valid_urls)]
+    _url_idx_ctx[_cid] = _idx + 1
+
+    start = chunk_index * chunk_size
+    end = start + chunk_size - 1
+
+    # First get file size to validate chunk_index
+    try:
+        client = _get_http_client(timeout=30.0)
+        resp_meta = await client.get(
+            _efile_url(base_url, "/efile/openapi/v2/file/download"),
+            params={"path": path},
+            headers={"token": token},
+            timeout=30.0,
+        )
+
+        content_type = resp_meta.headers.get("content-type", "")
+        if content_type and "json" in content_type:
+            meta_json = resp_meta.json()
+            if "error" in meta_json or "code" in meta_json:
+                return meta_json
+            file_size = meta_json.get("fileSize", meta_json.get("file_size", 0))
+        else:
+            cl = resp_meta.headers.get("content-length")
+            file_size = int(cl) if cl else 0
+
+        file_name = ""
+        content_disposition = resp_meta.headers.get("content-disposition", "")
+        if content_disposition:
+            match = re.search(r'filename[^;=\n]*=((["\']).*?\2|[^;\n]*)', content_disposition)
+            if match:
+                file_name = match.group(1).strip().strip('"\'')
+        if not file_name:
+            file_name = path.rstrip("/").rsplit("/", 1)[-1] if path else "download"
+
+        total_chunks = math.ceil(file_size / chunk_size) if file_size > 0 else 0
+
+        if chunk_index >= total_chunks:
+            return {
+                "error": True,
+                "message": f"分块索引 {chunk_index} 超出范围（文件共 {total_chunks} 个分块）。",
+                "file_name": file_name,
+                "file_size": file_size,
+                "total_chunks": total_chunks,
+                "chunk_index": chunk_index,
+                "chunk_size": chunk_size,
+            }
+
+        actual_end = min(end, file_size - 1)
+        range_header = f"bytes={start}-{actual_end}"
+
+        # Download the chunk with Range header
+        resp = await client.get(
+            _efile_url(base_url, "/efile/openapi/v2/file/download"),
+            params={"path": path},
+            headers={"token": token, "Range": range_header},
+            timeout=60.0,
+        )
+
+        if resp.status_code == 206:  # Partial Content
+            chunk_data = resp.content
+            chunk_b64 = base64.b64encode(chunk_data).decode("ascii")
+            return {
+                "file_name": file_name,
+                "file_size": file_size,
+                "chunk_index": chunk_index,
+                "total_chunks": total_chunks,
+                "chunk_size": chunk_size,
+                "chunk_start": start,
+                "chunk_end": actual_end,
+                "chunk_length": len(chunk_data),
+                "file_content_b64": chunk_b64,
+                "is_last_chunk": chunk_index == total_chunks - 1,
+                "message": (
+                    f"第 {chunk_index + 1}/{total_chunks} 块已返回 "
+                    f"({len(chunk_data) / 1024:.1f} KB raw / {len(chunk_b64) / 1024:.1f} KB b64)。"
+                    + (" 这是最后一块。" if chunk_index == total_chunks - 1 else " 还有后续分块。")
+                ),
+            }
+        elif resp.status_code == 416:  # Range Not Satisfiable
+            return {
+                "error": True,
+                "message": f"Range {range_header} 超出文件范围（文件大小: {file_size} bytes）。",
+                "file_name": file_name,
+                "file_size": file_size,
+            }
+        else:
+            resp.raise_for_status()
+            return {
+                "error": True,
+                "message": f"分块下载返回 HTTP {resp.status_code}，预期 206。",
+                "file_name": file_name,
+            }
+
+    except httpx.HTTPStatusError as exc:
+        try:
+            error_data = exc.response.json()
+            return error_data
+        except Exception:
+            return {
+                "error": True,
+                "message": f"分块下载失败 (HTTP {exc.response.status_code})。详情: {exc.response.text[:500]}",
+            }
+    except Exception as exc:
+        return {"error": True, "message": f"分块下载请求异常: {exc}"}
+
+
+@mcp.tool()
+async def efile_get_download_link(
+    path: Annotated[str, Field(description="要下载的文件/文件夹绝对路径")],
+    expires_in: Annotated[Optional[int], Field(description="链接有效期（秒），默认 3600 秒（1小时），最大 86400 秒（24小时）")] = 3600,
+    clusterId: Annotated[Optional[int], Field(description="集群 ID。为空时使用默认集群")] = None,
+) -> dict:
+    """生成文件的直接下载链接。返回一个包含认证 token 的 HTTP URL，
+    可通过浏览器、curl 或其他 HTTP 客户端直接下载，无需经过 MCP 协议。
+
+    适合大文件下载，避免 MCP 协议传输大体积 base64 数据。
+    """
+    username = get_current_username()
+
+    auth_result = check_auth(username)
+    if isinstance(auth_result, dict):
+        return auth_result
+
+    expires_in = max(60, min(expires_in or 3600, 86400))
+
+    conn = get_db()
+    try:
+        if clusterId is not None:
+            row = conn.execute(
+                "SELECT uc.token, cu.efileUrls "
+                "FROM user_cluster uc "
+                "LEFT JOIN cluster_url cu ON uc.clusterId = cu.clusterId "
+                "WHERE uc.userName = ? AND uc.clusterId = ?",
+                (username, clusterId),
+            ).fetchone()
+            if row is None:
+                return {
+                    "error": True,
+                    "message": f"集群 clusterId={clusterId} 不属于用户 '{username}'。",
+                }
+            token = row["token"]
+            efile_urls = row["efileUrls"]
+        else:
+            resolved = _get_default_token(username)
+            if "error" in resolved:
+                return resolved
+            token = resolved["token"]
+            efile_urls = resolved.get("efileUrls", "")
+    finally:
+        conn.close()
+
+    if not efile_urls:
+        return {"error": True, "message": "未查询到文件服务 URL（efileUrls）。"}
+
+    valid_urls = [u.strip().rstrip("/") for u in efile_urls.split(",") if u.strip()]
+    if not valid_urls:
+        return {"error": True, "message": "未找到有效的文件服务 URL。"}
+
+    base_url = valid_urls[0]
+
+    # Encode path for URL
+    encoded_path = path.replace(" ", "%20")
+
+    download_url = (
+        f"{base_url}/efile/openapi/v2/file/download?"
+        f"path={encoded_path}&token={token}&expires={expires_in}"
+    )
+
+    file_name = path.rstrip("/").rsplit("/", 1)[-1] if path else "download"
+
+    return {
+        "file_name": file_name,
+        "download_url": download_url,
+        "expires_in": expires_in,
+        "expires_at": time_mod.time() + expires_in,
+        "usage": (
+            f"📎 直接下载:\n"
+            f"  浏览器: {download_url[:120]}...\n"
+            f"  curl: curl -L -o '{file_name}' '{download_url[:120]}'\n"
+            f"  wget: wget -O '{file_name}' '{download_url[:120]}'"
+        ),
+        "warning": "下载链接包含认证 token，请勿分享给他人。",
+    }
+
+
+# ---------------------------------------------------------------------------
+# efile — share / async / chunk tools
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def efile_open_share(
+    file_path: Annotated[str, Field(description="要分享的文件的绝对路径")],
+    valid_days: Annotated[int, Field(description="链接有效天数，默认 30 天")] = 30,
+    clusterId: Annotated[Optional[int], Field(description="集群 ID。为空时使用默认集群")] = None,
+) -> dict:
+    """在 HPC 集群文件系统上为指定文件创建分享链接。
+
+    返回包含 serverCurlLink、serverFastransLink、webLink 和有效时长。
+    """
     username = get_current_username()
 
     auth_result = check_auth(username)
@@ -3447,60 +4732,36 @@ async def efile_download(
 
     try:
         client = _get_http_client(timeout=30.0)
-        resp = await client.get(
-            _efile_url(base_url, "/efile/openapi/v2/file/download"),
-            params={"path": path},
-            headers={"token": token},
-            timeout=120.0,
+        resp = await client.post(
+            _efile_url(base_url, "/efile/openapi/v2/file/open-share"),
+            params={"filePath": file_path, "validDays": valid_days},
+            headers={"token": token, "Content-Type": "application/json"},
+            timeout=15.0,
         )
         resp.raise_for_status()
-
-        content_type = resp.headers.get("content-type", "")
-        # If API returns JSON (error response), parse and return it
-        if content_type and "json" in content_type:
-            return resp.json()
-
-        file_bytes = resp.content
-        file_content_b64 = base64.b64encode(file_bytes).decode("utf-8")
-
-        # Derive file name from Content-Disposition header or path
-        content_disposition = resp.headers.get("content-disposition", "")
-        file_name = ""
-        if content_disposition:
-            match = re.search(r'filename[^;=\n]*=((["\']).*?\2|[^;\n]*)', content_disposition)
-            if match:
-                file_name = match.group(1).strip().strip('"\'')
-        if not file_name:
-            file_name = path.rstrip("/").rsplit("/", 1)[-1] if path else "download"
-
-        result = {
-            "file_name": file_name,
-            "file_content": file_content_b64,
-            "file_size": len(file_bytes),
-            "content_type": content_type or "application/octet-stream",
-        }
+        result = resp.json()
     except httpx.HTTPStatusError as exc:
-        # Try to parse error JSON from response body
-        try:
-            error_data = exc.response.json()
-            return error_data
-        except Exception:
-            return {
-                "error": True,
-                "message": f"下载文件失败 (HTTP {exc.response.status_code})。详情: {exc.response.text[:500]}",
-            }
+        return {
+            "error": True,
+            "message": (
+                f"开启文件分享失败 (HTTP {exc.response.status_code})。"
+                f"详情: {exc.response.text[:500]}"
+            ),
+            "status_code": exc.response.status_code,
+        }
     except Exception as exc:
-        return {"error": True, "message": f"下载文件请求异常: {exc}"}
+        return {"error": True, "message": f"开启文件分享请求异常: {exc}"}
 
-    returns_schema = _build_return_schema(result)
+    returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
-        "url": "{efileUrls}/efile/openapi/v2/file/download",
-        "method": "GET",
-        "description": "从 HPC 集群文件系统下载文件或文件夹。文件内容以 base64 编码字符串返回，文件夹以 zip 包返回。",
+        "url": "{efileUrls}/efile/openapi/v2/file/open-share",
+        "method": "POST",
+        "description": "为 HPC 集群文件系统上的指定文件创建分享链接，返回多种访问方式。",
         "parameters": {
-            "format": "URLParameter",
+            "format": "QueryParameter",
             "schema": {
-                "path": {"type": "string", "description": "要下载的文件/文件夹绝对路径", "optional": False},
+                "file_path": {"type": "string", "description": "要分享的文件的绝对路径", "optional": False},
+                "valid_days": {"type": "integer", "description": "链接有效天数，默认 30 天", "optional": True},
                 "clusterId": {"type": "integer", "description": "集群 ID，为空时使用默认集群", "optional": True},
             },
         },
@@ -3510,13 +4771,2623 @@ async def efile_download(
     try:
         conn2.execute(
             "INSERT OR REPLACE INTO APIs(name, document) VALUES (?, ?)",
-            ("efile_download", json.dumps(doc, ensure_ascii=False)),
+            ("efile_open_share", json.dumps(doc, ensure_ascii=False)),
         )
         conn2.commit()
     finally:
         conn2.close()
 
-    return _enrich_auth_error(result, username)
+    return result
+
+
+@mcp.tool()
+async def efile_close_share(
+    file_path: Annotated[str, Field(description="已分享文件的绝对路径")],
+    clusterId: Annotated[Optional[int], Field(description="集群 ID。为空时使用默认集群")] = None,
+) -> dict:
+    """关闭指定文件的分享链接。"""
+    username = get_current_username()
+
+    auth_result = check_auth(username)
+    if isinstance(auth_result, dict):
+        return auth_result
+
+    conn = get_db()
+    try:
+        if clusterId is not None:
+            row = conn.execute(
+                "SELECT uc.token, cu.efileUrls "
+                "FROM user_cluster uc "
+                "LEFT JOIN cluster_url cu ON uc.clusterId = cu.clusterId "
+                "WHERE uc.userName = ? AND uc.clusterId = ?",
+                (username, clusterId),
+            ).fetchone()
+            if row is None:
+                return {
+                    "error": True,
+                    "message": f"集群 clusterId={clusterId} 不属于用户 '{username}'。",
+                }
+            token = row["token"]
+            efile_urls = row["efileUrls"]
+        else:
+            resolved = _get_default_token(username)
+            if "error" in resolved:
+                return resolved
+            token = resolved["token"]
+            efile_urls = resolved.get("efileUrls", "")
+    finally:
+        conn.close()
+
+    if not efile_urls:
+        return {"error": True, "message": "未查询到文件服务 URL（efileUrls）。"}
+
+    valid_urls = [u.strip().rstrip("/") for u in efile_urls.split(",") if u.strip()]
+    if not valid_urls:
+        return {"error": True, "message": "未找到有效的文件服务 URL。"}
+
+    _cid = str(clusterId) if clusterId is not None else "default"
+    _idx = _url_idx_ctx.get(_cid, 0)
+    base_url = valid_urls[_idx % len(valid_urls)]
+    _url_idx_ctx[_cid] = _idx + 1
+
+    try:
+        client = _get_http_client(timeout=30.0)
+        resp = await client.post(
+            _efile_url(base_url, "/efile/openapi/v2/file/close-share"),
+            params={"filePath": file_path},
+            headers={"token": token, "Content-Type": "application/json"},
+            timeout=15.0,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+    except httpx.HTTPStatusError as exc:
+        return {
+            "error": True,
+            "message": (
+                f"关闭文件分享失败 (HTTP {exc.response.status_code})。"
+                f"详情: {exc.response.text[:500]}"
+            ),
+            "status_code": exc.response.status_code,
+        }
+    except Exception as exc:
+        return {"error": True, "message": f"关闭文件分享请求异常: {exc}"}
+
+    returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
+    doc = {
+        "url": "{efileUrls}/efile/openapi/v2/file/close-share",
+        "method": "POST",
+        "description": "关闭指定文件的分享链接。",
+        "parameters": {
+            "format": "QueryParameter",
+            "schema": {
+                "file_path": {"type": "string", "description": "已分享文件的绝对路径", "optional": False},
+                "clusterId": {"type": "integer", "description": "集群 ID，为空时使用默认集群", "optional": True},
+            },
+        },
+        "returns": {"format": "JSON", "schema": returns_schema},
+    }
+    conn2 = get_db()
+    try:
+        conn2.execute(
+            "INSERT OR REPLACE INTO APIs(name, document) VALUES (?, ?)",
+            ("efile_close_share", json.dumps(doc, ensure_ascii=False)),
+        )
+        conn2.commit()
+    finally:
+        conn2.close()
+
+    return result
+
+
+@mcp.tool()
+async def efile_async_copy(
+    tasks: Annotated[str, Field(
+        description="异步复制任务列表（JSON 数组字符串）。"
+        "每个元素包含 sourcePath（源文件绝对路径）、targetPath（目标目录绝对路径）、"
+        "duplicateHandleType（重复处理方式：cover 覆盖 / both 保留二者，可选）。"
+        "示例: [{\"sourcePath\": \"/home/a.txt\", \"targetPath\": \"/home/backup\", \"duplicateHandleType\": \"cover\"}]"
+    )],
+    clusterId: Annotated[Optional[int], Field(description="集群 ID。为空时使用默认集群")] = None,
+) -> dict:
+    """异步复制文件/文件夹。支持批量提交（最多 100 个任务），返回 taskId 用于查询进度和取消。"""
+    username = get_current_username()
+
+    auth_result = check_auth(username)
+    if isinstance(auth_result, dict):
+        return auth_result
+
+    # Parse tasks JSON
+    try:
+        tasks_list = json.loads(tasks)
+    except json.JSONDecodeError as exc:
+        return {"error": True, "message": f"tasks 参数 JSON 解析失败: {exc}"}
+
+    if not isinstance(tasks_list, list) or len(tasks_list) == 0:
+        return {"error": True, "message": "tasks 必须是非空 JSON 数组。"}
+
+    conn = get_db()
+    try:
+        if clusterId is not None:
+            row = conn.execute(
+                "SELECT uc.token, cu.efileUrls "
+                "FROM user_cluster uc "
+                "LEFT JOIN cluster_url cu ON uc.clusterId = cu.clusterId "
+                "WHERE uc.userName = ? AND uc.clusterId = ?",
+                (username, clusterId),
+            ).fetchone()
+            if row is None:
+                return {
+                    "error": True,
+                    "message": f"集群 clusterId={clusterId} 不属于用户 '{username}'。",
+                }
+            token = row["token"]
+            efile_urls = row["efileUrls"]
+        else:
+            resolved = _get_default_token(username)
+            if "error" in resolved:
+                return resolved
+            token = resolved["token"]
+            efile_urls = resolved.get("efileUrls", "")
+    finally:
+        conn.close()
+
+    if not efile_urls:
+        return {"error": True, "message": "未查询到文件服务 URL（efileUrls）。"}
+
+    valid_urls = [u.strip().rstrip("/") for u in efile_urls.split(",") if u.strip()]
+    if not valid_urls:
+        return {"error": True, "message": "未找到有效的文件服务 URL。"}
+
+    _cid = str(clusterId) if clusterId is not None else "default"
+    _idx = _url_idx_ctx.get(_cid, 0)
+    base_url = valid_urls[_idx % len(valid_urls)]
+    _url_idx_ctx[_cid] = _idx + 1
+
+    try:
+        client = _get_http_client(timeout=30.0)
+        resp = await client.post(
+            _efile_url(base_url, "/efile/openapi/v2/file/async-copy"),
+            json=tasks_list,
+            headers={"token": token, "Content-Type": "application/json"},
+            timeout=60.0,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+    except httpx.HTTPStatusError as exc:
+        return {
+            "error": True,
+            "message": (
+                f"异步复制失败 (HTTP {exc.response.status_code})。"
+                f"详情: {exc.response.text[:500]}"
+            ),
+            "status_code": exc.response.status_code,
+        }
+    except Exception as exc:
+        return {"error": True, "message": f"异步复制请求异常: {exc}"}
+
+    returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
+    doc = {
+        "url": "{efileUrls}/efile/openapi/v2/file/async-copy",
+        "method": "POST",
+        "description": "异步复制文件/文件夹，支持批量提交（最多 100 个任务），返回 taskId 用于查询进度和取消。",
+        "parameters": {
+            "format": "JSON",
+            "schema": {
+                "tasks": {"type": "string", "description": "JSON 数组，每元素含 sourcePath/targetPath/duplicateHandleType", "optional": False},
+                "clusterId": {"type": "integer", "description": "集群 ID，为空时使用默认集群", "optional": True},
+            },
+        },
+        "returns": {"format": "JSON", "schema": returns_schema},
+    }
+    conn2 = get_db()
+    try:
+        conn2.execute(
+            "INSERT OR REPLACE INTO APIs(name, document) VALUES (?, ?)",
+            ("efile_async_copy", json.dumps(doc, ensure_ascii=False)),
+        )
+        conn2.commit()
+    finally:
+        conn2.close()
+
+    return result
+
+
+@mcp.tool()
+async def efile_async_move(
+    tasks: Annotated[str, Field(
+        description="异步移动任务列表（JSON 数组字符串）。"
+        "每个元素包含 sourcePath（源文件绝对路径）、targetPath（目标目录绝对路径）、"
+        "duplicateHandleType（重复处理方式：cover 覆盖 / both 保留二者，可选）。"
+    )],
+    clusterId: Annotated[Optional[int], Field(description="集群 ID。为空时使用默认集群")] = None,
+) -> dict:
+    """异步移动文件/文件夹。支持批量提交（最多 100 个任务），返回 taskId 用于查询进度和取消。"""
+    username = get_current_username()
+
+    auth_result = check_auth(username)
+    if isinstance(auth_result, dict):
+        return auth_result
+
+    try:
+        tasks_list = json.loads(tasks)
+    except json.JSONDecodeError as exc:
+        return {"error": True, "message": f"tasks 参数 JSON 解析失败: {exc}"}
+
+    if not isinstance(tasks_list, list) or len(tasks_list) == 0:
+        return {"error": True, "message": "tasks 必须是非空 JSON 数组。"}
+
+    conn = get_db()
+    try:
+        if clusterId is not None:
+            row = conn.execute(
+                "SELECT uc.token, cu.efileUrls "
+                "FROM user_cluster uc "
+                "LEFT JOIN cluster_url cu ON uc.clusterId = cu.clusterId "
+                "WHERE uc.userName = ? AND uc.clusterId = ?",
+                (username, clusterId),
+            ).fetchone()
+            if row is None:
+                return {
+                    "error": True,
+                    "message": f"集群 clusterId={clusterId} 不属于用户 '{username}'。",
+                }
+            token = row["token"]
+            efile_urls = row["efileUrls"]
+        else:
+            resolved = _get_default_token(username)
+            if "error" in resolved:
+                return resolved
+            token = resolved["token"]
+            efile_urls = resolved.get("efileUrls", "")
+    finally:
+        conn.close()
+
+    if not efile_urls:
+        return {"error": True, "message": "未查询到文件服务 URL（efileUrls）。"}
+
+    valid_urls = [u.strip().rstrip("/") for u in efile_urls.split(",") if u.strip()]
+    if not valid_urls:
+        return {"error": True, "message": "未找到有效的文件服务 URL。"}
+
+    _cid = str(clusterId) if clusterId is not None else "default"
+    _idx = _url_idx_ctx.get(_cid, 0)
+    base_url = valid_urls[_idx % len(valid_urls)]
+    _url_idx_ctx[_cid] = _idx + 1
+
+    try:
+        client = _get_http_client(timeout=30.0)
+        resp = await client.post(
+            _efile_url(base_url, "/efile/openapi/v2/file/async-move"),
+            json=tasks_list,
+            headers={"token": token, "Content-Type": "application/json"},
+            timeout=60.0,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+    except httpx.HTTPStatusError as exc:
+        return {
+            "error": True,
+            "message": (
+                f"异步移动失败 (HTTP {exc.response.status_code})。"
+                f"详情: {exc.response.text[:500]}"
+            ),
+            "status_code": exc.response.status_code,
+        }
+    except Exception as exc:
+        return {"error": True, "message": f"异步移动请求异常: {exc}"}
+
+    returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
+    doc = {
+        "url": "{efileUrls}/efile/openapi/v2/file/async-move",
+        "method": "POST",
+        "description": "异步移动文件/文件夹，支持批量提交（最多 100 个任务），返回 taskId 用于查询进度和取消。",
+        "parameters": {
+            "format": "JSON",
+            "schema": {
+                "tasks": {"type": "string", "description": "JSON 数组，每元素含 sourcePath/targetPath/duplicateHandleType", "optional": False},
+                "clusterId": {"type": "integer", "description": "集群 ID，为空时使用默认集群", "optional": True},
+            },
+        },
+        "returns": {"format": "JSON", "schema": returns_schema},
+    }
+    conn2 = get_db()
+    try:
+        conn2.execute(
+            "INSERT OR REPLACE INTO APIs(name, document) VALUES (?, ?)",
+            ("efile_async_move", json.dumps(doc, ensure_ascii=False)),
+        )
+        conn2.commit()
+    finally:
+        conn2.close()
+
+    return result
+
+
+@mcp.tool()
+async def efile_async_delete(
+    tasks: Annotated[str, Field(
+        description="异步删除任务列表（JSON 数组字符串）。"
+        "每个元素包含 sourcePath（待删除文件/文件夹的绝对路径）。"
+        "示例: [{\"sourcePath\": \"/home/temp/file.txt\"}]"
+    )],
+    clusterId: Annotated[Optional[int], Field(description="集群 ID。为空时使用默认集群")] = None,
+) -> dict:
+    """异步删除文件/文件夹。支持批量提交（最多 100 个任务），返回 taskId 用于查询进度和取消。"""
+    username = get_current_username()
+
+    auth_result = check_auth(username)
+    if isinstance(auth_result, dict):
+        return auth_result
+
+    try:
+        tasks_list = json.loads(tasks)
+    except json.JSONDecodeError as exc:
+        return {"error": True, "message": f"tasks 参数 JSON 解析失败: {exc}"}
+
+    if not isinstance(tasks_list, list) or len(tasks_list) == 0:
+        return {"error": True, "message": "tasks 必须是非空 JSON 数组。"}
+
+    conn = get_db()
+    try:
+        if clusterId is not None:
+            row = conn.execute(
+                "SELECT uc.token, cu.efileUrls "
+                "FROM user_cluster uc "
+                "LEFT JOIN cluster_url cu ON uc.clusterId = cu.clusterId "
+                "WHERE uc.userName = ? AND uc.clusterId = ?",
+                (username, clusterId),
+            ).fetchone()
+            if row is None:
+                return {
+                    "error": True,
+                    "message": f"集群 clusterId={clusterId} 不属于用户 '{username}'。",
+                }
+            token = row["token"]
+            efile_urls = row["efileUrls"]
+        else:
+            resolved = _get_default_token(username)
+            if "error" in resolved:
+                return resolved
+            token = resolved["token"]
+            efile_urls = resolved.get("efileUrls", "")
+    finally:
+        conn.close()
+
+    if not efile_urls:
+        return {"error": True, "message": "未查询到文件服务 URL（efileUrls）。"}
+
+    valid_urls = [u.strip().rstrip("/") for u in efile_urls.split(",") if u.strip()]
+    if not valid_urls:
+        return {"error": True, "message": "未找到有效的文件服务 URL。"}
+
+    _cid = str(clusterId) if clusterId is not None else "default"
+    _idx = _url_idx_ctx.get(_cid, 0)
+    base_url = valid_urls[_idx % len(valid_urls)]
+    _url_idx_ctx[_cid] = _idx + 1
+
+    try:
+        client = _get_http_client(timeout=30.0)
+        resp = await client.post(
+            _efile_url(base_url, "/efile/openapi/v2/file/async-remove"),
+            json=tasks_list,
+            headers={"token": token, "Content-Type": "application/json"},
+            timeout=60.0,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+    except httpx.HTTPStatusError as exc:
+        return {
+            "error": True,
+            "message": (
+                f"异步删除失败 (HTTP {exc.response.status_code})。"
+                f"详情: {exc.response.text[:500]}"
+            ),
+            "status_code": exc.response.status_code,
+        }
+    except Exception as exc:
+        return {"error": True, "message": f"异步删除请求异常: {exc}"}
+
+    returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
+    doc = {
+        "url": "{efileUrls}/efile/openapi/v2/file/async-remove",
+        "method": "POST",
+        "description": "异步删除文件/文件夹，支持批量提交（最多 100 个任务），返回 taskId 用于查询进度和取消。",
+        "parameters": {
+            "format": "JSON",
+            "schema": {
+                "tasks": {"type": "string", "description": "JSON 数组，每元素含 sourcePath", "optional": False},
+                "clusterId": {"type": "integer", "description": "集群 ID，为空时使用默认集群", "optional": True},
+            },
+        },
+        "returns": {"format": "JSON", "schema": returns_schema},
+    }
+    conn2 = get_db()
+    try:
+        conn2.execute(
+            "INSERT OR REPLACE INTO APIs(name, document) VALUES (?, ?)",
+            ("efile_async_delete", json.dumps(doc, ensure_ascii=False)),
+        )
+        conn2.commit()
+    finally:
+        conn2.close()
+
+    return result
+
+
+@mcp.tool()
+async def efile_async_task_cancel(
+    task_ids: Annotated[str, Field(
+        description="要取消的异步任务 ID 列表（JSON 数组字符串）。"
+        "示例: [\"254653d8816b4407ba27a9d004342c0e\", \"3dc8b0a...\"]"
+    )],
+    clusterId: Annotated[Optional[int], Field(description="集群 ID。为空时使用默认集群")] = None,
+) -> dict:
+    """取消异步文件操作任务（复制/移动/删除）。已完成或已失败的任务无法取消。"""
+    username = get_current_username()
+
+    auth_result = check_auth(username)
+    if isinstance(auth_result, dict):
+        return auth_result
+
+    try:
+        task_ids_list = json.loads(task_ids)
+    except json.JSONDecodeError as exc:
+        return {"error": True, "message": f"task_ids 参数 JSON 解析失败: {exc}"}
+
+    if not isinstance(task_ids_list, list) or len(task_ids_list) == 0:
+        return {"error": True, "message": "task_ids 必须是非空 JSON 数组。"}
+
+    conn = get_db()
+    try:
+        if clusterId is not None:
+            row = conn.execute(
+                "SELECT uc.token, cu.efileUrls "
+                "FROM user_cluster uc "
+                "LEFT JOIN cluster_url cu ON uc.clusterId = cu.clusterId "
+                "WHERE uc.userName = ? AND uc.clusterId = ?",
+                (username, clusterId),
+            ).fetchone()
+            if row is None:
+                return {
+                    "error": True,
+                    "message": f"集群 clusterId={clusterId} 不属于用户 '{username}'。",
+                }
+            token = row["token"]
+            efile_urls = row["efileUrls"]
+        else:
+            resolved = _get_default_token(username)
+            if "error" in resolved:
+                return resolved
+            token = resolved["token"]
+            efile_urls = resolved.get("efileUrls", "")
+    finally:
+        conn.close()
+
+    if not efile_urls:
+        return {"error": True, "message": "未查询到文件服务 URL（efileUrls）。"}
+
+    valid_urls = [u.strip().rstrip("/") for u in efile_urls.split(",") if u.strip()]
+    if not valid_urls:
+        return {"error": True, "message": "未找到有效的文件服务 URL。"}
+
+    _cid = str(clusterId) if clusterId is not None else "default"
+    _idx = _url_idx_ctx.get(_cid, 0)
+    base_url = valid_urls[_idx % len(valid_urls)]
+    _url_idx_ctx[_cid] = _idx + 1
+
+    try:
+        client = _get_http_client(timeout=30.0)
+        resp = await client.post(
+            _efile_url(base_url, "/efile/openapi/v2/file/task/cancel"),
+            json={"taskIds": task_ids_list},
+            headers={"token": token, "Content-Type": "application/json"},
+            timeout=15.0,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+    except httpx.HTTPStatusError as exc:
+        return {
+            "error": True,
+            "message": (
+                f"取消异步任务失败 (HTTP {exc.response.status_code})。"
+                f"详情: {exc.response.text[:500]}"
+            ),
+            "status_code": exc.response.status_code,
+        }
+    except Exception as exc:
+        return {"error": True, "message": f"取消异步任务请求异常: {exc}"}
+
+    returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
+    doc = {
+        "url": "{efileUrls}/efile/openapi/v2/file/task/cancel",
+        "method": "POST",
+        "description": "取消异步文件操作任务（复制/移动/删除）。已完成或已失败的任务无法取消。",
+        "parameters": {
+            "format": "JSON",
+            "schema": {
+                "task_ids": {"type": "string", "description": "JSON 数组，要取消的 taskId 列表", "optional": False},
+                "clusterId": {"type": "integer", "description": "集群 ID，为空时使用默认集群", "optional": True},
+            },
+        },
+        "returns": {"format": "JSON", "schema": returns_schema},
+    }
+    conn2 = get_db()
+    try:
+        conn2.execute(
+            "INSERT OR REPLACE INTO APIs(name, document) VALUES (?, ?)",
+            ("efile_async_task_cancel", json.dumps(doc, ensure_ascii=False)),
+        )
+        conn2.commit()
+    finally:
+        conn2.close()
+
+    return result
+
+
+@mcp.tool()
+async def efile_async_task_list(
+    task_ids: Annotated[str, Field(
+        description="要查询的异步任务 ID 列表（JSON 数组字符串）。"
+        "示例: [\"10b10bf643814ebfb1fbf0d7e910e8d1\"]"
+    )],
+    clusterId: Annotated[Optional[int], Field(description="集群 ID。为空时使用默认集群")] = None,
+) -> dict:
+    """查询异步文件操作任务的进度和状态。任务结束后服务端缓存信息 24 小时。"""
+    username = get_current_username()
+
+    auth_result = check_auth(username)
+    if isinstance(auth_result, dict):
+        return auth_result
+
+    try:
+        task_ids_list = json.loads(task_ids)
+    except json.JSONDecodeError as exc:
+        return {"error": True, "message": f"task_ids 参数 JSON 解析失败: {exc}"}
+
+    if not isinstance(task_ids_list, list) or len(task_ids_list) == 0:
+        return {"error": True, "message": "task_ids 必须是非空 JSON 数组。"}
+
+    conn = get_db()
+    try:
+        if clusterId is not None:
+            row = conn.execute(
+                "SELECT uc.token, cu.efileUrls "
+                "FROM user_cluster uc "
+                "LEFT JOIN cluster_url cu ON uc.clusterId = cu.clusterId "
+                "WHERE uc.userName = ? AND uc.clusterId = ?",
+                (username, clusterId),
+            ).fetchone()
+            if row is None:
+                return {
+                    "error": True,
+                    "message": f"集群 clusterId={clusterId} 不属于用户 '{username}'。",
+                }
+            token = row["token"]
+            efile_urls = row["efileUrls"]
+        else:
+            resolved = _get_default_token(username)
+            if "error" in resolved:
+                return resolved
+            token = resolved["token"]
+            efile_urls = resolved.get("efileUrls", "")
+    finally:
+        conn.close()
+
+    if not efile_urls:
+        return {"error": True, "message": "未查询到文件服务 URL（efileUrls）。"}
+
+    valid_urls = [u.strip().rstrip("/") for u in efile_urls.split(",") if u.strip()]
+    if not valid_urls:
+        return {"error": True, "message": "未找到有效的文件服务 URL。"}
+
+    _cid = str(clusterId) if clusterId is not None else "default"
+    _idx = _url_idx_ctx.get(_cid, 0)
+    base_url = valid_urls[_idx % len(valid_urls)]
+    _url_idx_ctx[_cid] = _idx + 1
+
+    try:
+        client = _get_http_client(timeout=30.0)
+        resp = await client.post(
+            _efile_url(base_url, "/efile/openapi/v2/file/task/list"),
+            json={"taskIds": task_ids_list},
+            headers={"token": token, "Content-Type": "application/json"},
+            timeout=15.0,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+    except httpx.HTTPStatusError as exc:
+        return {
+            "error": True,
+            "message": (
+                f"查询异步任务失败 (HTTP {exc.response.status_code})。"
+                f"详情: {exc.response.text[:500]}"
+            ),
+            "status_code": exc.response.status_code,
+        }
+    except Exception as exc:
+        return {"error": True, "message": f"查询异步任务请求异常: {exc}"}
+
+    returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
+    doc = {
+        "url": "{efileUrls}/efile/openapi/v2/file/task/list",
+        "method": "POST",
+        "description": "查询异步文件操作任务的进度和状态。任务结束后服务端缓存信息 24 小时。",
+        "parameters": {
+            "format": "JSON",
+            "schema": {
+                "task_ids": {"type": "string", "description": "JSON 数组，要查询的 taskId 列表", "optional": False},
+                "clusterId": {"type": "integer", "description": "集群 ID，为空时使用默认集群", "optional": True},
+            },
+        },
+        "returns": {"format": "JSON", "schema": returns_schema},
+    }
+    conn2 = get_db()
+    try:
+        conn2.execute(
+            "INSERT OR REPLACE INTO APIs(name, document) VALUES (?, ?)",
+            ("efile_async_task_list", json.dumps(doc, ensure_ascii=False)),
+        )
+        conn2.commit()
+    finally:
+        conn2.close()
+
+    return result
+
+
+@mcp.tool()
+async def efile_chunk_upload(
+    file_content: Annotated[str, Field(description="当前分片的文件内容（base64 编码字符串）")],
+    file_name: Annotated[str, Field(description="原始文件名（如 result.tar.gz）")],
+    chunk_number: Annotated[int, Field(description="当前分片序号（从 1 开始）。不分片时填 1")],
+    total_chunks: Annotated[int, Field(description="分片总个数。不分片时填 1")],
+    total_size: Annotated[int, Field(description="文件总大小，单位：字节")],
+    path: Annotated[str, Field(description="远程目标文件夹路径（必须为绝对路径）")],
+    relative_path: Annotated[str, Field(description="文件相对于 path 的相对路径（包含文件名）")],
+    cover: Annotated[str, Field(description="覆盖策略：cover（强制覆盖）或 uncover（不覆盖），默认 uncover")] = "uncover",
+    identifier: Annotated[str, Field(description="文件标识，用于关联同一文件的不同分片。无需分片时可为空")] = "",
+    chunk_size: Annotated[int, Field(description="每片字节数，默认 5242880 (5MB)")] = 5242880,
+    clusterId: Annotated[Optional[int], Field(description="集群 ID。为空时使用默认集群")] = None,
+) -> dict:
+    """分片上传文件到 HPC 集群文件系统。大文件（>5GB）建议分片上传，每片 5MB。
+
+    文件内容通过 base64 编码字符串传入。分片上传完成后需调用 efile_merge_file 合并文件。
+    """
+    username = get_current_username()
+
+    auth_result = check_auth(username)
+    if isinstance(auth_result, dict):
+        return auth_result
+
+    # Decode base64 file content (streaming for large chunks)
+    try:
+        file_bytes = _b64decode_stream(file_content)
+    except (ValueError, Exception) as exc:
+        msg = str(exc) if isinstance(exc, ValueError) and "文件过大" in str(exc) else f"文件内容 base64 解码失败: {exc}"
+        return {"error": True, "message": msg}
+
+    conn = get_db()
+    try:
+        if clusterId is not None:
+            row = conn.execute(
+                "SELECT uc.token, cu.efileUrls "
+                "FROM user_cluster uc "
+                "LEFT JOIN cluster_url cu ON uc.clusterId = cu.clusterId "
+                "WHERE uc.userName = ? AND uc.clusterId = ?",
+                (username, clusterId),
+            ).fetchone()
+            if row is None:
+                return {
+                    "error": True,
+                    "message": f"集群 clusterId={clusterId} 不属于用户 '{username}'。",
+                }
+            token = row["token"]
+            efile_urls = row["efileUrls"]
+        else:
+            resolved = _get_default_token(username)
+            if "error" in resolved:
+                return resolved
+            token = resolved["token"]
+            efile_urls = resolved.get("efileUrls", "")
+    finally:
+        conn.close()
+
+    if not efile_urls:
+        return {"error": True, "message": "未查询到文件服务 URL（efileUrls）。"}
+
+    valid_urls = [u.strip().rstrip("/") for u in efile_urls.split(",") if u.strip()]
+    if not valid_urls:
+        return {"error": True, "message": "未找到有效的文件服务 URL。"}
+
+    _cid = str(clusterId) if clusterId is not None else "default"
+    _idx = _url_idx_ctx.get(_cid, 0)
+    base_url = valid_urls[_idx % len(valid_urls)]
+    _url_idx_ctx[_cid] = _idx + 1
+
+    try:
+        client = _get_http_client(timeout=120.0)
+        data_fields = {
+            "chunkNumber": str(chunk_number),
+            "cover": cover,
+            "filename": file_name,
+            "path": path,
+            "relativePath": relative_path,
+            "totalChunks": str(total_chunks),
+            "totalSize": str(total_size),
+            "chunkSize": str(chunk_size),
+            "currentChunkSize": str(len(file_bytes)),
+        }
+        if identifier:
+            data_fields["identifier"] = identifier
+
+        resp = await client.post(
+            _efile_url(base_url, "/efile/openapi/v2/file/burst"),
+            data=data_fields,
+            files={"file": (file_name, file_bytes)},
+            headers={"token": token},
+            timeout=120.0,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+    except httpx.HTTPStatusError as exc:
+        return {
+            "error": True,
+            "message": (
+                f"分片上传文件失败 (HTTP {exc.response.status_code})。"
+                f"详情: {exc.response.text[:500]}"
+            ),
+            "status_code": exc.response.status_code,
+        }
+    except Exception as exc:
+        return {"error": True, "message": f"分片上传请求异常: {exc}"}
+
+    returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
+    doc = {
+        "url": "{efileUrls}/efile/openapi/v2/file/burst",
+        "method": "POST",
+        "description": (
+            "分片上传文件到 HPC 集群文件系统。大文件（>5GB）建议分片上传，每片 5MB。"
+            "分片上传完成后需调用 efile_merge_file 合并文件。"
+        ),
+        "parameters": {
+            "format": "URLParameter",
+            "schema": {
+                "file_content": {"type": "string", "description": "当前分片的文件内容（base64 编码）", "optional": False},
+                "file_name": {"type": "string", "description": "原始文件名", "optional": False},
+                "chunk_number": {"type": "integer", "description": "当前分片序号（从 1 开始）", "optional": False},
+                "total_chunks": {"type": "integer", "description": "分片总个数", "optional": False},
+                "total_size": {"type": "integer", "description": "文件总大小（字节）", "optional": False},
+                "path": {"type": "string", "description": "远程目标文件夹路径（绝对路径）", "optional": False},
+                "relative_path": {"type": "string", "description": "文件相对 path 的路径（含文件名）", "optional": False},
+                "cover": {"type": "string", "description": "覆盖策略：cover/uncover，默认 uncover", "optional": True},
+                "identifier": {"type": "string", "description": "文件标识，用于关联分片", "optional": True},
+                "chunk_size": {"type": "integer", "description": "每片字节数，默认 5242880 (5MB)", "optional": True},
+                "clusterId": {"type": "integer", "description": "集群 ID，为空时使用默认集群", "optional": True},
+            },
+        },
+        "returns": {"format": "JSON", "schema": returns_schema},
+    }
+    conn2 = get_db()
+    try:
+        conn2.execute(
+            "INSERT OR REPLACE INTO APIs(name, document) VALUES (?, ?)",
+            ("efile_chunk_upload", json.dumps(doc, ensure_ascii=False)),
+        )
+        conn2.commit()
+    finally:
+        conn2.close()
+
+    return result
+
+
+@mcp.tool()
+async def efile_merge_file(
+    path: Annotated[str, Field(description="文件存放的目标文件夹路径（必须为绝对路径）")],
+    relative_path: Annotated[str, Field(description="文件相对 path 的路径（含文件名）。必须与分片上传时的 relativePath 一致")],
+    cover: Annotated[str, Field(description="覆盖策略：cover（强制覆盖）或 uncover（不覆盖）。必须与分片上传时一致")] = "uncover",
+    file_name: Annotated[str, Field(description="文件名。通常 relativePath 已包含文件名")] = "",
+    identifier: Annotated[str, Field(description="文件标识。分片上传时若传入则需传入")] = "",
+    file_id: Annotated[str, Field(description="文件 ID")] = "",
+    clusterId: Annotated[Optional[int], Field(description="集群 ID。为空时使用默认集群")] = None,
+) -> dict:
+    """合并分片上传完成的文件。分片上传全部完成后必须调用此接口，否则文件不完整。
+
+    返回合并后的文件路径。
+    """
+    username = get_current_username()
+
+    auth_result = check_auth(username)
+    if isinstance(auth_result, dict):
+        return auth_result
+
+    conn = get_db()
+    try:
+        if clusterId is not None:
+            row = conn.execute(
+                "SELECT uc.token, cu.efileUrls "
+                "FROM user_cluster uc "
+                "LEFT JOIN cluster_url cu ON uc.clusterId = cu.clusterId "
+                "WHERE uc.userName = ? AND uc.clusterId = ?",
+                (username, clusterId),
+            ).fetchone()
+            if row is None:
+                return {
+                    "error": True,
+                    "message": f"集群 clusterId={clusterId} 不属于用户 '{username}'。",
+                }
+            token = row["token"]
+            efile_urls = row["efileUrls"]
+        else:
+            resolved = _get_default_token(username)
+            if "error" in resolved:
+                return resolved
+            token = resolved["token"]
+            efile_urls = resolved.get("efileUrls", "")
+    finally:
+        conn.close()
+
+    if not efile_urls:
+        return {"error": True, "message": "未查询到文件服务 URL（efileUrls）。"}
+
+    valid_urls = [u.strip().rstrip("/") for u in efile_urls.split(",") if u.strip()]
+    if not valid_urls:
+        return {"error": True, "message": "未找到有效的文件服务 URL。"}
+
+    _cid = str(clusterId) if clusterId is not None else "default"
+    _idx = _url_idx_ctx.get(_cid, 0)
+    base_url = valid_urls[_idx % len(valid_urls)]
+    _url_idx_ctx[_cid] = _idx + 1
+
+    try:
+        client = _get_http_client(timeout=30.0)
+        data_fields = {
+            "cover": cover,
+            "path": path,
+            "relativePath": relative_path,
+        }
+        if file_name:
+            data_fields["filename"] = file_name
+        if identifier:
+            data_fields["identifier"] = identifier
+        if file_id:
+            data_fields["id"] = file_id
+
+        resp = await client.post(
+            _efile_url(base_url, "/efile/openapi/v2/file/merge"),
+            data=data_fields,
+            headers={"token": token},
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+    except httpx.HTTPStatusError as exc:
+        return {
+            "error": True,
+            "message": (
+                f"合并文件失败 (HTTP {exc.response.status_code})。"
+                f"详情: {exc.response.text[:500]}"
+            ),
+            "status_code": exc.response.status_code,
+        }
+    except Exception as exc:
+        return {"error": True, "message": f"合并文件请求异常: {exc}"}
+
+    returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
+    doc = {
+        "url": "{efileUrls}/efile/openapi/v2/file/merge",
+        "method": "POST",
+        "description": "合并分片上传完成的文件。分片上传全部完成后必须调用此接口，否则文件不完整。",
+        "parameters": {
+            "format": "URLParameter",
+            "schema": {
+                "path": {"type": "string", "description": "文件存放的目标文件夹路径（绝对路径）", "optional": False},
+                "relative_path": {"type": "string", "description": "相对路径（含文件名），必须与分片上传时一致", "optional": False},
+                "cover": {"type": "string", "description": "覆盖策略：cover/uncover，默认 uncover", "optional": True},
+                "file_name": {"type": "string", "description": "文件名", "optional": True},
+                "identifier": {"type": "string", "description": "文件标识", "optional": True},
+                "file_id": {"type": "string", "description": "文件 ID", "optional": True},
+                "clusterId": {"type": "integer", "description": "集群 ID，为空时使用默认集群", "optional": True},
+            },
+        },
+        "returns": {"format": "JSON", "schema": returns_schema},
+    }
+    conn2 = get_db()
+    try:
+        conn2.execute(
+            "INSERT OR REPLACE INTO APIs(name, document) VALUES (?, ?)",
+            ("efile_merge_file", json.dumps(doc, ensure_ascii=False)),
+        )
+        conn2.commit()
+    finally:
+        conn2.close()
+
+    return result
+
+
+@mcp.tool()
+async def efile_get_upload_config(
+    file_size_bytes: Annotated[int, Field(description="要上传的文件总大小，单位：字节")],
+) -> dict:
+    """根据文件大小返回推荐的上传策略和配置参数。
+
+    100MB 以下：直接使用 efile_upload 单次上传。
+    100MB-5GB：使用 efile_chunk_upload 分片上传，返回推荐的分片大小和总数。
+    超过 5GB：返回拒绝提示。
+    """
+    if file_size_bytes > MAX_FILE_SIZE_BYTES:
+        return {
+            "allowed": False,
+            "message": (
+                f"文件大小 {file_size_bytes / (1024**3):.2f} GB 超过最大支持 {MAX_FILE_SIZE_BYTES / (1024**3):.0f} GB。"
+                "请使用 SCP/SFTP 等直连方式传输超大文件。"
+            ),
+        }
+
+    if file_size_bytes <= MAX_SINGLE_TRANSFER_BYTES:
+        return {
+            "allowed": True,
+            "strategy": "single",
+            "message": f"文件 {file_size_bytes / (1024**2):.1f} MB，可直接使用 efile_upload 单次上传。",
+            "recommended_tool": "efile_upload",
+        }
+
+    chunk_size = CHUNK_UPLOAD_SIZE
+    total_chunks = math.ceil(file_size_bytes / chunk_size)
+    batch_size = min(MAX_CHUNKS_PER_BATCH, total_chunks)
+    estimated_batch_calls = math.ceil(total_chunks / batch_size)
+    encoded_chunk_size = int(chunk_size * 4 / 3)  # base64 encoded size per chunk
+
+    return {
+        "allowed": True,
+        "strategy": "chunked",
+        "message": (
+            f"文件 {file_size_bytes / (1024**3):.2f} GB，建议分 {total_chunks} 片上传，"
+            f"每片 {chunk_size / (1024**2):.0f} MB（base64 编码后约 {encoded_chunk_size / (1024**2):.0f} MB）。"
+            f"推荐每次批量上传 {batch_size} 片，共约 {estimated_batch_calls} 次调用。"
+        ),
+        "recommended_tool": "efile_chunk_upload",
+        "chunk_size": chunk_size,
+        "total_chunks": total_chunks,
+        "batch_size": batch_size,
+        "estimated_batch_calls": estimated_batch_calls,
+        "encoded_chunk_size": encoded_chunk_size,
+    }
+
+
+@mcp.tool()
+async def efile_batch_chunk_upload(
+    chunks_json: Annotated[str, Field(
+        description="分片数据（JSON 数组字符串），最多 10 片。"
+        "每片含: chunk_number(分片序号,从1开始), file_content(base64编码的分片内容)。"
+        "示例: [{\"chunk_number\":1,\"file_content\":\"aGVsbG8=\"},{\"chunk_number\":2,\"file_content\":\"d29ybGQ=\"}]"
+    )],
+    file_name: Annotated[str, Field(description="原始文件名（如 result.tar.gz）")],
+    total_chunks: Annotated[int, Field(description="分片总个数")],
+    total_size: Annotated[int, Field(description="文件总大小，单位：字节")],
+    path: Annotated[str, Field(description="远程目标文件夹路径（必须为绝对路径）")],
+    relative_path: Annotated[str, Field(description="文件相对于 path 的相对路径（包含文件名）")],
+    cover: Annotated[str, Field(description="覆盖策略：cover（强制覆盖）或 uncover（不覆盖），默认 uncover")] = "uncover",
+    identifier: Annotated[str, Field(description="文件标识，用于关联同一文件的不同分片")] = "",
+    clusterId: Annotated[Optional[int], Field(description="集群 ID。为空时使用默认集群")] = None,
+) -> dict:
+    """批量并行上传多个分片到 HPC 集群文件系统（最多 10 片/次）。
+
+    内部并行发送各分片请求，大幅减少 Agent 侧的串行调用次数。
+    使用前建议先调用 efile_get_upload_config 获取推荐配置。
+    所有分片上传完成后需调用 efile_merge_file 合并文件。
+    """
+    if total_size > MAX_FILE_SIZE_BYTES:
+        return {
+            "error": True,
+            "message": (
+                f"文件大小 {total_size / (1024**3):.2f} GB 超过最大支持 "
+                f"{MAX_FILE_SIZE_BYTES / (1024**3):.0f} GB。"
+            ),
+        }
+
+    username = get_current_username()
+
+    auth_result = check_auth(username)
+    if isinstance(auth_result, dict):
+        return auth_result
+
+    # Parse chunks JSON
+    try:
+        chunk_list = json.loads(chunks_json)
+    except json.JSONDecodeError as exc:
+        return {"error": True, "message": f"chunks_json 解析失败: {exc}"}
+
+    if not isinstance(chunk_list, list) or len(chunk_list) == 0:
+        return {"error": True, "message": "chunks_json 必须是非空 JSON 数组。"}
+
+    if len(chunk_list) > MAX_CHUNKS_PER_BATCH:
+        return {
+            "error": True,
+            "message": f"单次批量上传最多 {MAX_CHUNKS_PER_BATCH} 片，当前 {len(chunk_list)} 片。",
+        }
+
+    # Resolve cluster auth once for all chunks
+    conn = get_db()
+    try:
+        if clusterId is not None:
+            row = conn.execute(
+                "SELECT uc.token, cu.efileUrls "
+                "FROM user_cluster uc "
+                "LEFT JOIN cluster_url cu ON uc.clusterId = cu.clusterId "
+                "WHERE uc.userName = ? AND uc.clusterId = ?",
+                (username, clusterId),
+            ).fetchone()
+            if row is None:
+                return {
+                    "error": True,
+                    "message": f"集群 clusterId={clusterId} 不属于用户 '{username}'。",
+                }
+            token = row["token"]
+            efile_urls = row["efileUrls"]
+        else:
+            resolved = _get_default_token(username)
+            if "error" in resolved:
+                return resolved
+            token = resolved["token"]
+            efile_urls = resolved.get("efileUrls", "")
+    finally:
+        conn.close()
+
+    if not efile_urls:
+        return {"error": True, "message": "未查询到文件服务 URL（efileUrls）。"}
+
+    valid_urls = [u.strip().rstrip("/") for u in efile_urls.split(",") if u.strip()]
+    if not valid_urls:
+        return {"error": True, "message": "未找到有效的文件服务 URL。"}
+
+    _cid = str(clusterId) if clusterId is not None else "default"
+    _idx = _url_idx_ctx.get(_cid, 0)
+    base_url = valid_urls[_idx % len(valid_urls)]
+    _url_idx_ctx[_cid] = _idx + 1
+
+    async def _upload_one(chunk: dict) -> dict:
+        """Upload a single chunk and return its result."""
+        chunk_number = chunk.get("chunk_number", 0)
+        chunk_b64 = chunk.get("file_content", "")
+        try:
+            chunk_bytes = base64.b64decode(chunk_b64)
+        except Exception as exc:
+            return {
+                "chunk_number": chunk_number,
+                "success": False,
+                "error": f"base64 解码失败: {exc}",
+            }
+
+        try:
+            client = _get_http_client(timeout=120.0)
+            data_fields = {
+                "chunkNumber": str(chunk_number),
+                "cover": cover,
+                "filename": file_name,
+                "path": path,
+                "relativePath": relative_path,
+                "totalChunks": str(total_chunks),
+                "totalSize": str(total_size),
+                "chunkSize": str(CHUNK_UPLOAD_SIZE),
+                "currentChunkSize": str(len(chunk_bytes)),
+            }
+            if identifier:
+                data_fields["identifier"] = identifier
+
+            resp = await client.post(
+                _efile_url(base_url, "/efile/openapi/v2/file/burst"),
+                data=data_fields,
+                files={"file": (file_name, chunk_bytes)},
+                headers={"token": token},
+                timeout=120.0,
+            )
+            resp.raise_for_status()
+            return {
+                "chunk_number": chunk_number,
+                "success": True,
+                "response": resp.json(),
+            }
+        except httpx.HTTPStatusError as exc:
+            return {
+                "chunk_number": chunk_number,
+                "success": False,
+                "error": f"HTTP {exc.response.status_code}: {exc.response.text[:200]}",
+            }
+        except Exception as exc:
+            return {
+                "chunk_number": chunk_number,
+                "success": False,
+                "error": str(exc),
+            }
+
+    # Upload all chunks in parallel
+    results = await asyncio.gather(*[_upload_one(c) for c in chunk_list])
+
+    succeeded = [r for r in results if r.get("success")]
+    failed = [r for r in results if not r.get("success")]
+
+    summary = {
+        "total_chunks_in_batch": len(chunk_list),
+        "succeeded": len(succeeded),
+        "failed": len(failed),
+        "results": results,
+    }
+    if failed:
+        summary["warning"] = (
+            f"{len(failed)} 片上传失败，请重试失败的片。"
+            f"失败片号: {[f.get('chunk_number') for f in failed]}"
+        )
+
+    # Auto-register
+    returns_schema = _build_return_schema(summary)
+    doc = {
+        "url": "{efileUrls}/efile/openapi/v2/file/burst",
+        "method": "POST",
+        "description": "批量并行上传分片到 HPC 集群（最多 10 片/次）。",
+        "parameters": {
+            "format": "URLParameter",
+            "schema": {
+                "chunks_json": {"type": "string", "description": "分片 JSON 数组", "optional": False},
+                "file_name": {"type": "string", "description": "原始文件名", "optional": False},
+                "total_chunks": {"type": "integer", "description": "分片总个数", "optional": False},
+                "total_size": {"type": "integer", "description": "文件总大小（字节）", "optional": False},
+                "path": {"type": "string", "description": "远程目标文件夹路径", "optional": False},
+                "relative_path": {"type": "string", "description": "文件相对路径", "optional": False},
+                "cover": {"type": "string", "description": "覆盖策略", "optional": True},
+                "identifier": {"type": "string", "description": "文件标识", "optional": True},
+                "clusterId": {"type": "integer", "description": "集群 ID", "optional": True},
+            },
+        },
+        "returns": {"format": "JSON", "schema": returns_schema},
+    }
+    conn2 = get_db()
+    try:
+        conn2.execute(
+            "INSERT OR REPLACE INTO APIs(name, document) VALUES (?, ?)",
+            ("efile_batch_chunk_upload", json.dumps(doc, ensure_ascii=False)),
+        )
+        conn2.commit()
+    finally:
+        conn2.close()
+
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# Container Tools
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+async def container_create(
+    instance_service_name: Annotated[str, Field(description="容器实例名称")],
+    accelerator_type: Annotated[str, Field(description="加速器类型：mlu / dcu / gpu / cpu")],
+    image_path: Annotated[str, Field(description="镜像路径。可从 container_get_images 的 path 字段获取")],
+    version: Annotated[str, Field(description="镜像名称。可从 container_get_images 的 version 字段获取")],
+    task_type: Annotated[str, Field(description="任务类型：ssh / jupyter / codeserver / rstudio")],
+    resource_group: Annotated[str, Field(description="资源分组。可从 container_query_resource_group 获取")],
+    cpu_number: Annotated[int, Field(description="CPU 数量")],
+    ram_size: Annotated[int, Field(description="内存大小，单位 MB")],
+    gpu_number: Annotated[int, Field(description="GPU 数量。若 accelerator_type 为 cpu 则填 0")],
+    timeout_limit: Annotated[str, Field(description="自动停止时间，格式 HH:MM:SS 或 unlimited")],
+    use_start_script: Annotated[bool, Field(description="是否启用启动脚本")] = False,
+    task_number: Annotated[int, Field(description="实例任务数量")] = 1,
+    description: Annotated[str, Field(description="描述信息")] = "",
+    start_script_action_scope: Annotated[str, Field(description="启动脚本作用范围：all（所有容器）或 header（首个容器）")] = "all",
+    start_script_content: Annotated[str, Field(description="启动脚本内容。多行命令每行末尾加 \\n")] = "",
+    mount_info_list: Annotated[str, Field(description="挂载信息列表（JSON 数组字符串）。每项含 sourcePath/targetPath/type。示例: [{\"sourcePath\":\"/home/source\",\"targetPath\":\"/mnt/target\",\"type\":\"data\"}]")] = "[]",
+    container_port_info_list: Annotated[str, Field(description="服务端口列表（JSON 数组字符串）。每项含 containerPort/protocolType。示例: [{\"containerPort\":18888,\"protocolType\":\"HTTP\"}]")] = "[]",
+    cluster_id: Annotated[Optional[int], Field(description="集群 ID。为空时使用默认集群")] = None,
+) -> dict:
+    """创建容器实例，支持 SSH/Jupyter/CodeServer/RStudio 等多种类型。
+
+    返回任务 ID 用于跟踪创建进度。token 取自 user_cluster 表，aiUrls 取自 cluster_url 表。
+    """
+    username = get_current_username()
+
+    auth_result = check_auth(username)
+    if isinstance(auth_result, dict):
+        return auth_result
+
+    # Parse JSON list params
+    try:
+        mount_list = json.loads(mount_info_list) if mount_info_list else []
+    except json.JSONDecodeError:
+        return {"error": True, "message": "mount_info_list JSON 解析失败"}
+    try:
+        port_list = json.loads(container_port_info_list) if container_port_info_list else []
+    except json.JSONDecodeError:
+        return {"error": True, "message": "container_port_info_list JSON 解析失败"}
+
+    conn = get_db()
+    try:
+        if cluster_id is not None:
+            row = conn.execute(
+                "SELECT uc.token, cu.aiUrls "
+                "FROM user_cluster uc "
+                "LEFT JOIN cluster_url cu ON uc.clusterId = cu.clusterId "
+                "WHERE uc.userName = ? AND uc.clusterId = ?",
+                (username, cluster_id),
+            ).fetchone()
+            if row is None:
+                return {
+                    "error": True,
+                    "message": f"集群 clusterId={cluster_id} 不属于用户 '{username}'。",
+                }
+            token = row["token"]
+            ai_urls = row["aiUrls"]
+        else:
+            resolved = _get_default_token(username)
+            if "error" in resolved:
+                return resolved
+            token = resolved["token"]
+            ai_urls = resolved.get("aiUrls", "")
+    finally:
+        conn.close()
+
+    if not ai_urls:
+        return {"error": True, "message": "未查询到 AI 服务 URL（aiUrls）。"}
+
+    valid_urls = [u.strip().rstrip("/") for u in ai_urls.split(",") if u.strip()]
+    if not valid_urls:
+        return {"error": True, "message": "未找到有效的 AI 服务 URL。"}
+
+    _cid = str(cluster_id) if cluster_id is not None else "default"
+    _idx = _url_idx_ctx.get(_cid, 0)
+    base_url = valid_urls[_idx % len(valid_urls)]
+    _url_idx_ctx[_cid] = _idx + 1
+
+    body: dict[str, Any] = {
+        "instanceServiceName": instance_service_name,
+        "acceleratorType": accelerator_type,
+        "imagePath": image_path,
+        "version": version,
+        "taskType": task_type,
+        "resourceGroup": resource_group,
+        "cpuNumber": cpu_number,
+        "ramSize": ram_size,
+        "gpuNumber": gpu_number,
+        "timeoutLimit": timeout_limit,
+        "useStartScript": use_start_script,
+        "taskNumber": task_number,
+        "startScriptActionScope": start_script_action_scope,
+        "startScriptContent": start_script_content,
+        "mountInfoList": mount_list,
+        "containerPortInfoList": port_list,
+    }
+    if description:
+        body["description"] = description
+
+    try:
+        client = _get_http_client(timeout=30.0)
+        resp = await client.post(
+            _ai_url(base_url, "/ai/openapi/v2/instance-service/task"),
+            json=body,
+            headers={"token": token, "Content-Type": "application/json"},
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+    except httpx.HTTPStatusError as exc:
+        return {
+            "error": True,
+            "message": (
+                f"创建容器实例失败 (HTTP {exc.response.status_code})。"
+                f"详情: {exc.response.text[:500]}"
+            ),
+            "status_code": exc.response.status_code,
+        }
+    except Exception as exc:
+        return {"error": True, "message": f"创建容器实例请求异常: {exc}"}
+
+    returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
+    doc = {
+        "url": "{aiUrls}/ai/openapi/v2/instance-service/task",
+        "method": "POST",
+        "description": "创建容器实例，支持 SSH/Jupyter/CodeServer/RStudio 等多种类型。返回任务 ID。",
+        "parameters": {
+            "format": "JSON",
+            "schema": {
+                "instance_service_name": {"type": "string", "description": "容器实例名称", "optional": False},
+                "accelerator_type": {"type": "string", "description": "加速器类型", "optional": False},
+                "image_path": {"type": "string", "description": "镜像路径", "optional": False},
+                "version": {"type": "string", "description": "镜像名称", "optional": False},
+                "task_type": {"type": "string", "description": "任务类型", "optional": False},
+                "resource_group": {"type": "string", "description": "资源分组", "optional": False},
+                "cpu_number": {"type": "integer", "description": "CPU 数量", "optional": False},
+                "ram_size": {"type": "integer", "description": "内存大小 MB", "optional": False},
+                "gpu_number": {"type": "integer", "description": "GPU 数量", "optional": False},
+                "timeout_limit": {"type": "string", "description": "自动停止时间", "optional": False},
+                "use_start_script": {"type": "boolean", "description": "是否启用启动脚本", "optional": True},
+                "task_number": {"type": "integer", "description": "实例任务数量", "optional": True},
+                "description": {"type": "string", "description": "描述信息", "optional": True},
+                "start_script_action_scope": {"type": "string", "description": "脚本作用范围", "optional": True},
+                "start_script_content": {"type": "string", "description": "启动脚本内容", "optional": True},
+                "mount_info_list": {"type": "string", "description": "挂载信息 JSON 数组", "optional": True},
+                "container_port_info_list": {"type": "string", "description": "端口信息 JSON 数组", "optional": True},
+                "cluster_id": {"type": "integer", "description": "集群 ID", "optional": True},
+            },
+        },
+        "returns": {"format": "JSON", "schema": returns_schema},
+    }
+    conn2 = get_db()
+    try:
+        conn2.execute(
+            "INSERT OR REPLACE INTO APIs(name, document) VALUES (?, ?)",
+            ("container_create", json.dumps(doc, ensure_ascii=False)),
+        )
+        conn2.commit()
+    finally:
+        conn2.close()
+
+    return result
+
+
+@mcp.tool()
+async def container_start(
+    instance_service_id: Annotated[str, Field(description="容器实例 ID。可从 container_query_list 获取")],
+    cluster_id: Annotated[Optional[int], Field(description="集群 ID。为空时使用默认集群")] = None,
+) -> dict:
+    """重新启动停止、失败等状态的容器实例。"""
+    username = get_current_username()
+
+    auth_result = check_auth(username)
+    if isinstance(auth_result, dict):
+        return auth_result
+
+    conn = get_db()
+    try:
+        if cluster_id is not None:
+            row = conn.execute(
+                "SELECT uc.token, cu.aiUrls "
+                "FROM user_cluster uc "
+                "LEFT JOIN cluster_url cu ON uc.clusterId = cu.clusterId "
+                "WHERE uc.userName = ? AND uc.clusterId = ?",
+                (username, cluster_id),
+            ).fetchone()
+            if row is None:
+                return {
+                    "error": True,
+                    "message": f"集群 clusterId={cluster_id} 不属于用户 '{username}'。",
+                }
+            token = row["token"]
+            ai_urls = row["aiUrls"]
+        else:
+            resolved = _get_default_token(username)
+            if "error" in resolved:
+                return resolved
+            token = resolved["token"]
+            ai_urls = resolved.get("aiUrls", "")
+    finally:
+        conn.close()
+
+    if not ai_urls:
+        return {"error": True, "message": "未查询到 AI 服务 URL（aiUrls）。"}
+
+    valid_urls = [u.strip().rstrip("/") for u in ai_urls.split(",") if u.strip()]
+    if not valid_urls:
+        return {"error": True, "message": "未找到有效的 AI 服务 URL。"}
+
+    _cid = str(cluster_id) if cluster_id is not None else "default"
+    _idx = _url_idx_ctx.get(_cid, 0)
+    base_url = valid_urls[_idx % len(valid_urls)]
+    _url_idx_ctx[_cid] = _idx + 1
+
+    try:
+        client = _get_http_client(timeout=30.0)
+        resp = await client.post(
+            f"{_ai_url(base_url, '/ai/openapi/v2/instance-service/task/actions/restart')}",
+            params={"instanceServiceId": instance_service_id},
+            headers={"token": token},
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+    except httpx.HTTPStatusError as exc:
+        return {
+            "error": True,
+            "message": (
+                f"启动容器实例失败 (HTTP {exc.response.status_code})。"
+                f"详情: {exc.response.text[:500]}"
+            ),
+            "status_code": exc.response.status_code,
+        }
+    except Exception as exc:
+        return {"error": True, "message": f"启动容器实例请求异常: {exc}"}
+
+    returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
+    doc = {
+        "url": "{aiUrls}/ai/openapi/v2/instance-service/task/actions/restart",
+        "method": "POST",
+        "description": "重新启动停止、失败等状态的容器实例。",
+        "parameters": {
+            "format": "QueryParameter",
+            "schema": {
+                "instance_service_id": {"type": "string", "description": "容器实例 ID", "optional": False},
+                "cluster_id": {"type": "integer", "description": "集群 ID", "optional": True},
+            },
+        },
+        "returns": {"format": "JSON", "schema": returns_schema},
+    }
+    conn2 = get_db()
+    try:
+        conn2.execute(
+            "INSERT OR REPLACE INTO APIs(name, document) VALUES (?, ?)",
+            ("container_start", json.dumps(doc, ensure_ascii=False)),
+        )
+        conn2.commit()
+    finally:
+        conn2.close()
+
+    return result
+
+
+@mcp.tool()
+async def container_stop(
+    ids: Annotated[str, Field(description="待停止的容器实例 ID 列表，多个 ID 用英文逗号分隔")],
+    cluster_id: Annotated[Optional[int], Field(description="集群 ID。为空时使用默认集群")] = None,
+) -> dict:
+    """批量停止容器实例。"""
+    username = get_current_username()
+
+    auth_result = check_auth(username)
+    if isinstance(auth_result, dict):
+        return auth_result
+
+    id_list = [i.strip() for i in ids.split(",") if i.strip()]
+    if not id_list:
+        return {"error": True, "message": "未提供有效的容器实例 ID。"}
+
+    conn = get_db()
+    try:
+        if cluster_id is not None:
+            row = conn.execute(
+                "SELECT uc.token, cu.aiUrls "
+                "FROM user_cluster uc "
+                "LEFT JOIN cluster_url cu ON uc.clusterId = cu.clusterId "
+                "WHERE uc.userName = ? AND uc.clusterId = ?",
+                (username, cluster_id),
+            ).fetchone()
+            if row is None:
+                return {
+                    "error": True,
+                    "message": f"集群 clusterId={cluster_id} 不属于用户 '{username}'。",
+                }
+            token = row["token"]
+            ai_urls = row["aiUrls"]
+        else:
+            resolved = _get_default_token(username)
+            if "error" in resolved:
+                return resolved
+            token = resolved["token"]
+            ai_urls = resolved.get("aiUrls", "")
+    finally:
+        conn.close()
+
+    if not ai_urls:
+        return {"error": True, "message": "未查询到 AI 服务 URL（aiUrls）。"}
+
+    valid_urls = [u.strip().rstrip("/") for u in ai_urls.split(",") if u.strip()]
+    if not valid_urls:
+        return {"error": True, "message": "未找到有效的 AI 服务 URL。"}
+
+    _cid = str(cluster_id) if cluster_id is not None else "default"
+    _idx = _url_idx_ctx.get(_cid, 0)
+    base_url = valid_urls[_idx % len(valid_urls)]
+    _url_idx_ctx[_cid] = _idx + 1
+
+    # Build URL with multiple ids params
+    params_list = [("ids", i) for i in id_list]
+    query_string = "&".join(f"{k}={v}" for k, v in params_list)
+
+    try:
+        client = _get_http_client(timeout=30.0)
+        resp = await client.post(
+            f"{_ai_url(base_url, '/ai/openapi/v2/instance-service/task/actions/stop')}?{query_string}",
+            headers={"token": token},
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+    except httpx.HTTPStatusError as exc:
+        return {
+            "error": True,
+            "message": (
+                f"停止容器实例失败 (HTTP {exc.response.status_code})。"
+                f"详情: {exc.response.text[:500]}"
+            ),
+            "status_code": exc.response.status_code,
+        }
+    except Exception as exc:
+        return {"error": True, "message": f"停止容器实例请求异常: {exc}"}
+
+    returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
+    doc = {
+        "url": "{aiUrls}/ai/openapi/v2/instance-service/task/actions/stop",
+        "method": "POST",
+        "description": "批量停止容器实例。多个 ID 用逗号分隔。",
+        "parameters": {
+            "format": "QueryParameter",
+            "schema": {
+                "ids": {"type": "string", "description": "容器实例 ID 列表（逗号分隔）", "optional": False},
+                "cluster_id": {"type": "integer", "description": "集群 ID", "optional": True},
+            },
+        },
+        "returns": {"format": "JSON", "schema": returns_schema},
+    }
+    conn2 = get_db()
+    try:
+        conn2.execute(
+            "INSERT OR REPLACE INTO APIs(name, document) VALUES (?, ?)",
+            ("container_stop", json.dumps(doc, ensure_ascii=False)),
+        )
+        conn2.commit()
+    finally:
+        conn2.close()
+
+    return result
+
+
+@mcp.tool()
+async def container_delete(
+    ids: Annotated[str, Field(description="待删除的容器实例 ID 列表，多个 ID 用英文逗号分隔")],
+    cluster_id: Annotated[Optional[int], Field(description="集群 ID。为空时使用默认集群")] = None,
+) -> dict:
+    """批量删除容器实例。"""
+    username = get_current_username()
+
+    auth_result = check_auth(username)
+    if isinstance(auth_result, dict):
+        return auth_result
+
+    id_list = [i.strip() for i in ids.split(",") if i.strip()]
+    if not id_list:
+        return {"error": True, "message": "未提供有效的容器实例 ID。"}
+
+    conn = get_db()
+    try:
+        if cluster_id is not None:
+            row = conn.execute(
+                "SELECT uc.token, cu.aiUrls "
+                "FROM user_cluster uc "
+                "LEFT JOIN cluster_url cu ON uc.clusterId = cu.clusterId "
+                "WHERE uc.userName = ? AND uc.clusterId = ?",
+                (username, cluster_id),
+            ).fetchone()
+            if row is None:
+                return {
+                    "error": True,
+                    "message": f"集群 clusterId={cluster_id} 不属于用户 '{username}'。",
+                }
+            token = row["token"]
+            ai_urls = row["aiUrls"]
+        else:
+            resolved = _get_default_token(username)
+            if "error" in resolved:
+                return resolved
+            token = resolved["token"]
+            ai_urls = resolved.get("aiUrls", "")
+    finally:
+        conn.close()
+
+    if not ai_urls:
+        return {"error": True, "message": "未查询到 AI 服务 URL（aiUrls）。"}
+
+    valid_urls = [u.strip().rstrip("/") for u in ai_urls.split(",") if u.strip()]
+    if not valid_urls:
+        return {"error": True, "message": "未找到有效的 AI 服务 URL。"}
+
+    _cid = str(cluster_id) if cluster_id is not None else "default"
+    _idx = _url_idx_ctx.get(_cid, 0)
+    base_url = valid_urls[_idx % len(valid_urls)]
+    _url_idx_ctx[_cid] = _idx + 1
+
+    params_list = [("ids", i) for i in id_list]
+    query_string = "&".join(f"{k}={v}" for k, v in params_list)
+
+    try:
+        client = _get_http_client(timeout=30.0)
+        resp = await client.delete(
+            f"{_ai_url(base_url, '/ai/openapi/v2/instance-service/task')}?{query_string}",
+            headers={"token": token},
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+    except httpx.HTTPStatusError as exc:
+        return {
+            "error": True,
+            "message": (
+                f"删除容器实例失败 (HTTP {exc.response.status_code})。"
+                f"详情: {exc.response.text[:500]}"
+            ),
+            "status_code": exc.response.status_code,
+        }
+    except Exception as exc:
+        return {"error": True, "message": f"删除容器实例请求异常: {exc}"}
+
+    returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
+    doc = {
+        "url": "{aiUrls}/ai/openapi/v2/instance-service/task",
+        "method": "DELETE",
+        "description": "批量删除容器实例。多个 ID 用逗号分隔。",
+        "parameters": {
+            "format": "QueryParameter",
+            "schema": {
+                "ids": {"type": "string", "description": "容器实例 ID 列表（逗号分隔）", "optional": False},
+                "cluster_id": {"type": "integer", "description": "集群 ID", "optional": True},
+            },
+        },
+        "returns": {"format": "JSON", "schema": returns_schema},
+    }
+    conn2 = get_db()
+    try:
+        conn2.execute(
+            "INSERT OR REPLACE INTO APIs(name, document) VALUES (?, ?)",
+            ("container_delete", json.dumps(doc, ensure_ascii=False)),
+        )
+        conn2.commit()
+    finally:
+        conn2.close()
+
+    return result
+
+
+@mcp.tool()
+async def container_execute(
+    instance_id: Annotated[str, Field(description="容器实例 ID")],
+    start_script_content: Annotated[str, Field(description="要执行的脚本内容。多行命令每行末尾加 \\n 换行转义符")],
+    start_script_action_scope: Annotated[str, Field(description="执行范围：all（所有容器）或 header（首个容器）")] = "all",
+    cluster_id: Annotated[Optional[int], Field(description="集群 ID。为空时使用默认集群")] = None,
+) -> dict:
+    """对容器实例批量执行脚本。"""
+    username = get_current_username()
+
+    auth_result = check_auth(username)
+    if isinstance(auth_result, dict):
+        return auth_result
+
+    conn = get_db()
+    try:
+        if cluster_id is not None:
+            row = conn.execute(
+                "SELECT uc.token, cu.aiUrls "
+                "FROM user_cluster uc "
+                "LEFT JOIN cluster_url cu ON uc.clusterId = cu.clusterId "
+                "WHERE uc.userName = ? AND uc.clusterId = ?",
+                (username, cluster_id),
+            ).fetchone()
+            if row is None:
+                return {
+                    "error": True,
+                    "message": f"集群 clusterId={cluster_id} 不属于用户 '{username}'。",
+                }
+            token = row["token"]
+            ai_urls = row["aiUrls"]
+        else:
+            resolved = _get_default_token(username)
+            if "error" in resolved:
+                return resolved
+            token = resolved["token"]
+            ai_urls = resolved.get("aiUrls", "")
+    finally:
+        conn.close()
+
+    if not ai_urls:
+        return {"error": True, "message": "未查询到 AI 服务 URL（aiUrls）。"}
+
+    valid_urls = [u.strip().rstrip("/") for u in ai_urls.split(",") if u.strip()]
+    if not valid_urls:
+        return {"error": True, "message": "未找到有效的 AI 服务 URL。"}
+
+    _cid = str(cluster_id) if cluster_id is not None else "default"
+    _idx = _url_idx_ctx.get(_cid, 0)
+    base_url = valid_urls[_idx % len(valid_urls)]
+    _url_idx_ctx[_cid] = _idx + 1
+
+    try:
+        client = _get_http_client(timeout=30.0)
+        resp = await client.post(
+            _ai_url(base_url, "/ai/openapi/v2/instance-service/task/actions/execute-script"),
+            json={
+                "id": instance_id,
+                "startScriptContent": start_script_content,
+                "startScriptActionScope": start_script_action_scope,
+            },
+            headers={"token": token, "Content-Type": "application/json"},
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+    except httpx.HTTPStatusError as exc:
+        return {
+            "error": True,
+            "message": (
+                f"执行脚本失败 (HTTP {exc.response.status_code})。"
+                f"详情: {exc.response.text[:500]}"
+            ),
+            "status_code": exc.response.status_code,
+        }
+    except Exception as exc:
+        return {"error": True, "message": f"执行脚本请求异常: {exc}"}
+
+    returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
+    doc = {
+        "url": "{aiUrls}/ai/openapi/v2/instance-service/task/actions/execute-script",
+        "method": "POST",
+        "description": "对容器实例批量执行脚本。",
+        "parameters": {
+            "format": "JSON",
+            "schema": {
+                "instance_id": {"type": "string", "description": "容器实例 ID", "optional": False},
+                "start_script_content": {"type": "string", "description": "脚本内容", "optional": False},
+                "start_script_action_scope": {"type": "string", "description": "执行范围：all/header", "optional": True},
+                "cluster_id": {"type": "integer", "description": "集群 ID", "optional": True},
+            },
+        },
+        "returns": {"format": "JSON", "schema": returns_schema},
+    }
+    conn2 = get_db()
+    try:
+        conn2.execute(
+            "INSERT OR REPLACE INTO APIs(name, document) VALUES (?, ?)",
+            ("container_execute", json.dumps(doc, ensure_ascii=False)),
+        )
+        conn2.commit()
+    finally:
+        conn2.close()
+
+    return result
+
+
+@mcp.tool()
+async def container_query_list(
+    limit: Annotated[int, Field(description="每页返回条数")] = 20,
+    sort: Annotated[str, Field(description="排序方式：asc / desc")] = "desc",
+    start: Annotated[int, Field(description="起始位置，默认 0")] = 0,
+    status: Annotated[str, Field(description="状态筛选：Running / Deploying / Waiting / Terminated / Failed / Completed")] = "",
+    task_type: Annotated[str, Field(description="任务类型筛选：ssh / jupyter / codeserver / rstudio")] = "",
+    instance_service_name: Annotated[str, Field(description="容器实例名称（模糊匹配）")] = "",
+    cluster_id: Annotated[Optional[int], Field(description="集群 ID。为空时使用默认集群")] = None,
+) -> dict:
+    """查询容器实例列表，支持按状态、类型、名称筛选和分页排序。"""
+    username = get_current_username()
+
+    auth_result = check_auth(username)
+    if isinstance(auth_result, dict):
+        return auth_result
+
+    conn = get_db()
+    try:
+        if cluster_id is not None:
+            row = conn.execute(
+                "SELECT uc.token, cu.aiUrls "
+                "FROM user_cluster uc "
+                "LEFT JOIN cluster_url cu ON uc.clusterId = cu.clusterId "
+                "WHERE uc.userName = ? AND uc.clusterId = ?",
+                (username, cluster_id),
+            ).fetchone()
+            if row is None:
+                return {
+                    "error": True,
+                    "message": f"集群 clusterId={cluster_id} 不属于用户 '{username}'。",
+                }
+            token = row["token"]
+            ai_urls = row["aiUrls"]
+        else:
+            resolved = _get_default_token(username)
+            if "error" in resolved:
+                return resolved
+            token = resolved["token"]
+            ai_urls = resolved.get("aiUrls", "")
+    finally:
+        conn.close()
+
+    if not ai_urls:
+        return {"error": True, "message": "未查询到 AI 服务 URL（aiUrls）。"}
+
+    valid_urls = [u.strip().rstrip("/") for u in ai_urls.split(",") if u.strip()]
+    if not valid_urls:
+        return {"error": True, "message": "未找到有效的 AI 服务 URL。"}
+
+    _cid = str(cluster_id) if cluster_id is not None else "default"
+    _idx = _url_idx_ctx.get(_cid, 0)
+    base_url = valid_urls[_idx % len(valid_urls)]
+    _url_idx_ctx[_cid] = _idx + 1
+
+    body: dict[str, Any] = {
+        "start": start,
+        "limit": limit,
+        "sort": sort,
+    }
+    if status:
+        body["status"] = status
+    if task_type:
+        body["taskType"] = task_type
+    if instance_service_name:
+        body["instanceServiceName"] = instance_service_name
+
+    try:
+        client = _get_http_client(timeout=30.0)
+        resp = await client.request(
+            "GET",
+            _ai_url(base_url, "/ai/openapi/v2/instance-service/task"),
+            json=body,
+            headers={"token": token, "Content-Type": "application/json"},
+            timeout=15.0,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+    except httpx.HTTPStatusError as exc:
+        return {
+            "error": True,
+            "message": (
+                f"查询容器实例列表失败 (HTTP {exc.response.status_code})。"
+                f"详情: {exc.response.text[:500]}"
+            ),
+            "status_code": exc.response.status_code,
+        }
+    except Exception as exc:
+        return {"error": True, "message": f"查询容器实例列表请求异常: {exc}"}
+
+    returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
+    doc = {
+        "url": "{aiUrls}/ai/openapi/v2/instance-service/task",
+        "method": "GET",
+        "description": "查询容器实例列表，支持按状态、类型、名称筛选和分页排序。",
+        "parameters": {
+            "format": "JSON",
+            "schema": {
+                "limit": {"type": "integer", "description": "每页条数", "optional": True},
+                "sort": {"type": "string", "description": "排序方式", "optional": True},
+                "start": {"type": "integer", "description": "起始位置", "optional": True},
+                "status": {"type": "string", "description": "状态筛选", "optional": True},
+                "task_type": {"type": "string", "description": "任务类型筛选", "optional": True},
+                "instance_service_name": {"type": "string", "description": "容器名称", "optional": True},
+                "cluster_id": {"type": "integer", "description": "集群 ID", "optional": True},
+            },
+        },
+        "returns": {"format": "JSON", "schema": returns_schema},
+    }
+    conn2 = get_db()
+    try:
+        conn2.execute(
+            "INSERT OR REPLACE INTO APIs(name, document) VALUES (?, ?)",
+            ("container_query_list", json.dumps(doc, ensure_ascii=False)),
+        )
+        conn2.commit()
+    finally:
+        conn2.close()
+
+    return result
+
+
+@mcp.tool()
+async def container_query_url(
+    instance_id: Annotated[str, Field(description="容器实例 ID")],
+    cluster_id: Annotated[Optional[int], Field(description="集群 ID。为空时使用默认集群")] = None,
+) -> dict:
+    """获取容器实例的访问 URL（如 JupyterLab 地址）。"""
+    username = get_current_username()
+
+    auth_result = check_auth(username)
+    if isinstance(auth_result, dict):
+        return auth_result
+
+    conn = get_db()
+    try:
+        if cluster_id is not None:
+            row = conn.execute(
+                "SELECT uc.token, cu.aiUrls "
+                "FROM user_cluster uc "
+                "LEFT JOIN cluster_url cu ON uc.clusterId = cu.clusterId "
+                "WHERE uc.userName = ? AND uc.clusterId = ?",
+                (username, cluster_id),
+            ).fetchone()
+            if row is None:
+                return {
+                    "error": True,
+                    "message": f"集群 clusterId={cluster_id} 不属于用户 '{username}'。",
+                }
+            token = row["token"]
+            ai_urls = row["aiUrls"]
+        else:
+            resolved = _get_default_token(username)
+            if "error" in resolved:
+                return resolved
+            token = resolved["token"]
+            ai_urls = resolved.get("aiUrls", "")
+    finally:
+        conn.close()
+
+    if not ai_urls:
+        return {"error": True, "message": "未查询到 AI 服务 URL（aiUrls）。"}
+
+    valid_urls = [u.strip().rstrip("/") for u in ai_urls.split(",") if u.strip()]
+    if not valid_urls:
+        return {"error": True, "message": "未找到有效的 AI 服务 URL。"}
+
+    _cid = str(cluster_id) if cluster_id is not None else "default"
+    _idx = _url_idx_ctx.get(_cid, 0)
+    base_url = valid_urls[_idx % len(valid_urls)]
+    _url_idx_ctx[_cid] = _idx + 1
+
+    try:
+        client = _get_http_client(timeout=30.0)
+        resp = await client.get(
+            f"{_ai_url(base_url, '/ai/openapi/v2/instance-service')}/{instance_id}/url",
+            headers={"token": token},
+            timeout=15.0,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+    except httpx.HTTPStatusError as exc:
+        return {
+            "error": True,
+            "message": (
+                f"获取容器实例 URL 失败 (HTTP {exc.response.status_code})。"
+                f"详情: {exc.response.text[:500]}"
+            ),
+            "status_code": exc.response.status_code,
+        }
+    except Exception as exc:
+        return {"error": True, "message": f"获取容器实例 URL 请求异常: {exc}"}
+
+    returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
+    doc = {
+        "url": "{aiUrls}/ai/openapi/v2/instance-service/{id}/url",
+        "method": "GET",
+        "description": "获取容器实例的访问 URL。",
+        "parameters": {
+            "format": "URLParameter",
+            "schema": {
+                "instance_id": {"type": "string", "description": "容器实例 ID", "optional": False},
+                "cluster_id": {"type": "integer", "description": "集群 ID", "optional": True},
+            },
+        },
+        "returns": {"format": "JSON", "schema": returns_schema},
+    }
+    conn2 = get_db()
+    try:
+        conn2.execute(
+            "INSERT OR REPLACE INTO APIs(name, document) VALUES (?, ?)",
+            ("container_query_url", json.dumps(doc, ensure_ascii=False)),
+        )
+        conn2.commit()
+    finally:
+        conn2.close()
+
+    return result
+
+
+@mcp.tool()
+async def container_query_detail(
+    instance_id: Annotated[str, Field(description="容器实例 ID")],
+    cluster_id: Annotated[Optional[int], Field(description="集群 ID。为空时使用默认集群")] = None,
+) -> dict:
+    """查询容器实例的详细信息，包含配置、状态、挂载、端口等完整数据。"""
+    username = get_current_username()
+
+    auth_result = check_auth(username)
+    if isinstance(auth_result, dict):
+        return auth_result
+
+    conn = get_db()
+    try:
+        if cluster_id is not None:
+            row = conn.execute(
+                "SELECT uc.token, cu.aiUrls "
+                "FROM user_cluster uc "
+                "LEFT JOIN cluster_url cu ON uc.clusterId = cu.clusterId "
+                "WHERE uc.userName = ? AND uc.clusterId = ?",
+                (username, cluster_id),
+            ).fetchone()
+            if row is None:
+                return {
+                    "error": True,
+                    "message": f"集群 clusterId={cluster_id} 不属于用户 '{username}'。",
+                }
+            token = row["token"]
+            ai_urls = row["aiUrls"]
+        else:
+            resolved = _get_default_token(username)
+            if "error" in resolved:
+                return resolved
+            token = resolved["token"]
+            ai_urls = resolved.get("aiUrls", "")
+    finally:
+        conn.close()
+
+    if not ai_urls:
+        return {"error": True, "message": "未查询到 AI 服务 URL（aiUrls）。"}
+
+    valid_urls = [u.strip().rstrip("/") for u in ai_urls.split(",") if u.strip()]
+    if not valid_urls:
+        return {"error": True, "message": "未找到有效的 AI 服务 URL。"}
+
+    _cid = str(cluster_id) if cluster_id is not None else "default"
+    _idx = _url_idx_ctx.get(_cid, 0)
+    base_url = valid_urls[_idx % len(valid_urls)]
+    _url_idx_ctx[_cid] = _idx + 1
+
+    try:
+        client = _get_http_client(timeout=30.0)
+        resp = await client.get(
+            f"{_ai_url(base_url, '/ai/openapi/v2/instance-service')}/{instance_id}/detail",
+            headers={"token": token},
+            timeout=15.0,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+    except httpx.HTTPStatusError as exc:
+        return {
+            "error": True,
+            "message": (
+                f"查询容器实例详情失败 (HTTP {exc.response.status_code})。"
+                f"详情: {exc.response.text[:500]}"
+            ),
+            "status_code": exc.response.status_code,
+        }
+    except Exception as exc:
+        return {"error": True, "message": f"查询容器实例详情请求异常: {exc}"}
+
+    returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
+    doc = {
+        "url": "{aiUrls}/ai/openapi/v2/instance-service/{id}/detail",
+        "method": "GET",
+        "description": "查询容器实例详细信息，包含配置、状态、挂载、端口等完整数据。",
+        "parameters": {
+            "format": "URLParameter",
+            "schema": {
+                "instance_id": {"type": "string", "description": "容器实例 ID", "optional": False},
+                "cluster_id": {"type": "integer", "description": "集群 ID", "optional": True},
+            },
+        },
+        "returns": {"format": "JSON", "schema": returns_schema},
+    }
+    conn2 = get_db()
+    try:
+        conn2.execute(
+            "INSERT OR REPLACE INTO APIs(name, document) VALUES (?, ?)",
+            ("container_query_detail", json.dumps(doc, ensure_ascii=False)),
+        )
+        conn2.commit()
+    finally:
+        conn2.close()
+
+    return result
+
+
+@mcp.tool()
+async def container_update_resource(
+    instance_id: Annotated[str, Field(description="容器实例 ID")],
+    cpu_number: Annotated[int, Field(description="CPU 数量")],
+    gpu_number: Annotated[int, Field(description="GPU 数量。若 accelerator_type 为 cpu 则填 0")],
+    ram_size: Annotated[int, Field(description="内存大小，单位 MB")],
+    cluster_id: Annotated[Optional[int], Field(description="集群 ID。为空时使用默认集群")] = None,
+) -> dict:
+    """更新容器实例的资源规格（CPU/GPU/内存）。仅非运行状态可修改。"""
+    username = get_current_username()
+
+    auth_result = check_auth(username)
+    if isinstance(auth_result, dict):
+        return auth_result
+
+    conn = get_db()
+    try:
+        if cluster_id is not None:
+            row = conn.execute(
+                "SELECT uc.token, cu.aiUrls "
+                "FROM user_cluster uc "
+                "LEFT JOIN cluster_url cu ON uc.clusterId = cu.clusterId "
+                "WHERE uc.userName = ? AND uc.clusterId = ?",
+                (username, cluster_id),
+            ).fetchone()
+            if row is None:
+                return {
+                    "error": True,
+                    "message": f"集群 clusterId={cluster_id} 不属于用户 '{username}'。",
+                }
+            token = row["token"]
+            ai_urls = row["aiUrls"]
+        else:
+            resolved = _get_default_token(username)
+            if "error" in resolved:
+                return resolved
+            token = resolved["token"]
+            ai_urls = resolved.get("aiUrls", "")
+    finally:
+        conn.close()
+
+    if not ai_urls:
+        return {"error": True, "message": "未查询到 AI 服务 URL（aiUrls）。"}
+
+    valid_urls = [u.strip().rstrip("/") for u in ai_urls.split(",") if u.strip()]
+    if not valid_urls:
+        return {"error": True, "message": "未找到有效的 AI 服务 URL。"}
+
+    _cid = str(cluster_id) if cluster_id is not None else "default"
+    _idx = _url_idx_ctx.get(_cid, 0)
+    base_url = valid_urls[_idx % len(valid_urls)]
+    _url_idx_ctx[_cid] = _idx + 1
+
+    try:
+        client = _get_http_client(timeout=30.0)
+        resp = await client.post(
+            _ai_url(base_url, "/ai/openapi/v2/instance-service/resource-spec/actions/update"),
+            json={
+                "id": instance_id,
+                "cpuNumber": cpu_number,
+                "gpuNumber": gpu_number,
+                "ramSize": ram_size,
+            },
+            headers={"token": token, "Content-Type": "application/json"},
+            timeout=15.0,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+    except httpx.HTTPStatusError as exc:
+        return {
+            "error": True,
+            "message": (
+                f"更新资源规格失败 (HTTP {exc.response.status_code})。"
+                f"详情: {exc.response.text[:500]}"
+            ),
+            "status_code": exc.response.status_code,
+        }
+    except Exception as exc:
+        return {"error": True, "message": f"更新资源规格请求异常: {exc}"}
+
+    returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
+    doc = {
+        "url": "{aiUrls}/ai/openapi/v2/instance-service/resource-spec/actions/update",
+        "method": "POST",
+        "description": "更新容器实例的资源规格（CPU/GPU/内存）。仅非运行状态可修改。",
+        "parameters": {
+            "format": "JSON",
+            "schema": {
+                "instance_id": {"type": "string", "description": "容器实例 ID", "optional": False},
+                "cpu_number": {"type": "integer", "description": "CPU 数量", "optional": False},
+                "gpu_number": {"type": "integer", "description": "GPU 数量", "optional": False},
+                "ram_size": {"type": "integer", "description": "内存大小 MB", "optional": False},
+                "cluster_id": {"type": "integer", "description": "集群 ID", "optional": True},
+            },
+        },
+        "returns": {"format": "JSON", "schema": returns_schema},
+    }
+    conn2 = get_db()
+    try:
+        conn2.execute(
+            "INSERT OR REPLACE INTO APIs(name, document) VALUES (?, ?)",
+            ("container_update_resource", json.dumps(doc, ensure_ascii=False)),
+        )
+        conn2.commit()
+    finally:
+        conn2.close()
+
+    return result
+
+
+@mcp.tool()
+async def container_query_resources(
+    accelerator_type: Annotated[str, Field(description="加速器类型：mlu / dcu / gpu / cpu")],
+    resource_group: Annotated[str, Field(description="资源分组名称。可从 container_query_resource_group 获取")],
+    cluster_id: Annotated[Optional[int], Field(description="集群 ID。为空时使用默认集群")] = None,
+) -> dict:
+    """查询指定资源分组的节点资源限额（单节点 CPU 核数、GPU 数、内存等）。"""
+    username = get_current_username()
+
+    auth_result = check_auth(username)
+    if isinstance(auth_result, dict):
+        return auth_result
+
+    conn = get_db()
+    try:
+        if cluster_id is not None:
+            row = conn.execute(
+                "SELECT uc.token, cu.aiUrls "
+                "FROM user_cluster uc "
+                "LEFT JOIN cluster_url cu ON uc.clusterId = cu.clusterId "
+                "WHERE uc.userName = ? AND uc.clusterId = ?",
+                (username, cluster_id),
+            ).fetchone()
+            if row is None:
+                return {
+                    "error": True,
+                    "message": f"集群 clusterId={cluster_id} 不属于用户 '{username}'。",
+                }
+            token = row["token"]
+            ai_urls = row["aiUrls"]
+        else:
+            resolved = _get_default_token(username)
+            if "error" in resolved:
+                return resolved
+            token = resolved["token"]
+            ai_urls = resolved.get("aiUrls", "")
+    finally:
+        conn.close()
+
+    if not ai_urls:
+        return {"error": True, "message": "未查询到 AI 服务 URL（aiUrls）。"}
+
+    valid_urls = [u.strip().rstrip("/") for u in ai_urls.split(",") if u.strip()]
+    if not valid_urls:
+        return {"error": True, "message": "未找到有效的 AI 服务 URL。"}
+
+    _cid = str(cluster_id) if cluster_id is not None else "default"
+    _idx = _url_idx_ctx.get(_cid, 0)
+    base_url = valid_urls[_idx % len(valid_urls)]
+    _url_idx_ctx[_cid] = _idx + 1
+
+    try:
+        client = _get_http_client(timeout=30.0)
+        resp = await client.get(
+            _ai_url(base_url, "/ai/openapi/v2/instance-service/resources"),
+            params={"acceleratorType": accelerator_type, "resourceGroup": resource_group},
+            headers={"token": token},
+            timeout=15.0,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+    except httpx.HTTPStatusError as exc:
+        return {
+            "error": True,
+            "message": (
+                f"查询节点资源限额失败 (HTTP {exc.response.status_code})。"
+                f"详情: {exc.response.text[:500]}"
+            ),
+            "status_code": exc.response.status_code,
+        }
+    except Exception as exc:
+        return {"error": True, "message": f"查询节点资源限额请求异常: {exc}"}
+
+    returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
+    doc = {
+        "url": "{aiUrls}/ai/openapi/v2/instance-service/resources",
+        "method": "GET",
+        "description": "查询指定资源分组的节点资源限额（单节点 CPU 核数、GPU 数、内存等）。",
+        "parameters": {
+            "format": "QueryParameter",
+            "schema": {
+                "accelerator_type": {"type": "string", "description": "加速器类型", "optional": False},
+                "resource_group": {"type": "string", "description": "资源分组名称", "optional": False},
+                "cluster_id": {"type": "integer", "description": "集群 ID", "optional": True},
+            },
+        },
+        "returns": {"format": "JSON", "schema": returns_schema},
+    }
+    conn2 = get_db()
+    try:
+        conn2.execute(
+            "INSERT OR REPLACE INTO APIs(name, document) VALUES (?, ?)",
+            ("container_query_resources", json.dumps(doc, ensure_ascii=False)),
+        )
+        conn2.commit()
+    finally:
+        conn2.close()
+
+    return result
+
+
+@mcp.tool()
+async def container_query_resource_group(
+    cluster_id: Annotated[Optional[int], Field(description="集群 ID。为空时使用默认集群")] = None,
+) -> dict:
+    """获取当前用户可用的资源分组列表，按加速器类型（gpu/dcu/mlu/cpu）分组返回。"""
+    username = get_current_username()
+
+    auth_result = check_auth(username)
+    if isinstance(auth_result, dict):
+        return auth_result
+
+    conn = get_db()
+    try:
+        if cluster_id is not None:
+            row = conn.execute(
+                "SELECT uc.token, cu.aiUrls "
+                "FROM user_cluster uc "
+                "LEFT JOIN cluster_url cu ON uc.clusterId = cu.clusterId "
+                "WHERE uc.userName = ? AND uc.clusterId = ?",
+                (username, cluster_id),
+            ).fetchone()
+            if row is None:
+                return {
+                    "error": True,
+                    "message": f"集群 clusterId={cluster_id} 不属于用户 '{username}'。",
+                }
+            token = row["token"]
+            ai_urls = row["aiUrls"]
+        else:
+            resolved = _get_default_token(username)
+            if "error" in resolved:
+                return resolved
+            token = resolved["token"]
+            ai_urls = resolved.get("aiUrls", "")
+    finally:
+        conn.close()
+
+    if not ai_urls:
+        return {"error": True, "message": "未查询到 AI 服务 URL（aiUrls）。"}
+
+    valid_urls = [u.strip().rstrip("/") for u in ai_urls.split(",") if u.strip()]
+    if not valid_urls:
+        return {"error": True, "message": "未找到有效的 AI 服务 URL。"}
+
+    _cid = str(cluster_id) if cluster_id is not None else "default"
+    _idx = _url_idx_ctx.get(_cid, 0)
+    base_url = valid_urls[_idx % len(valid_urls)]
+    _url_idx_ctx[_cid] = _idx + 1
+
+    try:
+        client = _get_http_client(timeout=30.0)
+        resp = await client.get(
+            _ai_url(base_url, "/ai/openapi/v2/instance-service/resource-group"),
+            headers={"token": token},
+            timeout=15.0,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+    except httpx.HTTPStatusError as exc:
+        return {
+            "error": True,
+            "message": (
+                f"查询资源分组失败 (HTTP {exc.response.status_code})。"
+                f"详情: {exc.response.text[:500]}"
+            ),
+            "status_code": exc.response.status_code,
+        }
+    except Exception as exc:
+        return {"error": True, "message": f"查询资源分组请求异常: {exc}"}
+
+    returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
+    doc = {
+        "url": "{aiUrls}/ai/openapi/v2/instance-service/resource-group",
+        "method": "GET",
+        "description": "获取当前用户可用的资源分组列表，按加速器类型分组返回。",
+        "parameters": {
+            "format": "QueryParameter",
+            "schema": {
+                "cluster_id": {"type": "integer", "description": "集群 ID", "optional": True},
+            },
+        },
+        "returns": {"format": "JSON", "schema": returns_schema},
+    }
+    conn2 = get_db()
+    try:
+        conn2.execute(
+            "INSERT OR REPLACE INTO APIs(name, document) VALUES (?, ?)",
+            ("container_query_resource_group", json.dumps(doc, ensure_ascii=False)),
+        )
+        conn2.commit()
+    finally:
+        conn2.close()
+
+    return result
+
+
+@mcp.tool()
+async def container_query_allowed_mount_dir(
+    cluster_id: Annotated[Optional[int], Field(description="集群 ID。为空时使用默认集群")] = None,
+) -> dict:
+    """获取当前用户被授权允许挂载的目录列表。"""
+    username = get_current_username()
+
+    auth_result = check_auth(username)
+    if isinstance(auth_result, dict):
+        return auth_result
+
+    conn = get_db()
+    try:
+        if cluster_id is not None:
+            row = conn.execute(
+                "SELECT uc.token, cu.aiUrls "
+                "FROM user_cluster uc "
+                "LEFT JOIN cluster_url cu ON uc.clusterId = cu.clusterId "
+                "WHERE uc.userName = ? AND uc.clusterId = ?",
+                (username, cluster_id),
+            ).fetchone()
+            if row is None:
+                return {
+                    "error": True,
+                    "message": f"集群 clusterId={cluster_id} 不属于用户 '{username}'。",
+                }
+            token = row["token"]
+            ai_urls = row["aiUrls"]
+        else:
+            resolved = _get_default_token(username)
+            if "error" in resolved:
+                return resolved
+            token = resolved["token"]
+            ai_urls = resolved.get("aiUrls", "")
+    finally:
+        conn.close()
+
+    if not ai_urls:
+        return {"error": True, "message": "未查询到 AI 服务 URL（aiUrls）。"}
+
+    valid_urls = [u.strip().rstrip("/") for u in ai_urls.split(",") if u.strip()]
+    if not valid_urls:
+        return {"error": True, "message": "未找到有效的 AI 服务 URL。"}
+
+    _cid = str(cluster_id) if cluster_id is not None else "default"
+    _idx = _url_idx_ctx.get(_cid, 0)
+    base_url = valid_urls[_idx % len(valid_urls)]
+    _url_idx_ctx[_cid] = _idx + 1
+
+    try:
+        client = _get_http_client(timeout=30.0)
+        resp = await client.get(
+            _ai_url(base_url, "/ai/openapi/v2/instance-service/allowed-mount-dir"),
+            headers={"token": token},
+            timeout=15.0,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+    except httpx.HTTPStatusError as exc:
+        return {
+            "error": True,
+            "message": (
+                f"查询授权挂载路径失败 (HTTP {exc.response.status_code})。"
+                f"详情: {exc.response.text[:500]}"
+            ),
+            "status_code": exc.response.status_code,
+        }
+    except Exception as exc:
+        return {"error": True, "message": f"查询授权挂载路径请求异常: {exc}"}
+
+    returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
+    doc = {
+        "url": "{aiUrls}/ai/openapi/v2/instance-service/allowed-mount-dir",
+        "method": "GET",
+        "description": "获取当前用户被授权允许挂载的目录列表。",
+        "parameters": {
+            "format": "QueryParameter",
+            "schema": {
+                "cluster_id": {"type": "integer", "description": "集群 ID", "optional": True},
+            },
+        },
+        "returns": {"format": "JSON", "schema": returns_schema},
+    }
+    conn2 = get_db()
+    try:
+        conn2.execute(
+            "INSERT OR REPLACE INTO APIs(name, document) VALUES (?, ?)",
+            ("container_query_allowed_mount_dir", json.dumps(doc, ensure_ascii=False)),
+        )
+        conn2.commit()
+    finally:
+        conn2.close()
+
+    return result
+
+
+@mcp.tool()
+async def container_get_images(
+    access: Annotated[str, Field(description="镜像权限：public（公开）或 private（私有）")],
+    order_by: Annotated[str, Field(description="排序字段：create_time / share_time / clone_times")] = "create_time",
+    sort: Annotated[str, Field(description="排序方式：DESC / ASC")] = "DESC",
+    limit: Annotated[int, Field(description="每页数量")] = 20,
+    start: Annotated[int, Field(description="起始条数")] = 0,
+    name: Annotated[str, Field(description="镜像名称（模糊匹配）")] = "",
+    image_type: Annotated[str, Field(description="镜像类型：JupyterLab / CodeServer / RStudio / Base 等")] = "",
+    accelerator_type: Annotated[str, Field(description="加速器类型：mlu / dcu / gpu / cpu")] = "",
+    cluster_id: Annotated[Optional[int], Field(description="集群 ID。为空时使用默认集群")] = None,
+) -> dict:
+    """获取可用的容器镜像列表，支持按名称、类型、加速器筛选和分页排序。
+
+    返回的 path、version 可用于 container_create。
+    """
+    username = get_current_username()
+
+    auth_result = check_auth(username)
+    if isinstance(auth_result, dict):
+        return auth_result
+
+    conn = get_db()
+    try:
+        if cluster_id is not None:
+            row = conn.execute(
+                "SELECT uc.token, cu.aiUrls "
+                "FROM user_cluster uc "
+                "LEFT JOIN cluster_url cu ON uc.clusterId = cu.clusterId "
+                "WHERE uc.userName = ? AND uc.clusterId = ?",
+                (username, cluster_id),
+            ).fetchone()
+            if row is None:
+                return {
+                    "error": True,
+                    "message": f"集群 clusterId={cluster_id} 不属于用户 '{username}'。",
+                }
+            token = row["token"]
+            ai_urls = row["aiUrls"]
+        else:
+            resolved = _get_default_token(username)
+            if "error" in resolved:
+                return resolved
+            token = resolved["token"]
+            ai_urls = resolved.get("aiUrls", "")
+    finally:
+        conn.close()
+
+    if not ai_urls:
+        return {"error": True, "message": "未查询到 AI 服务 URL（aiUrls）。"}
+
+    valid_urls = [u.strip().rstrip("/") for u in ai_urls.split(",") if u.strip()]
+    if not valid_urls:
+        return {"error": True, "message": "未找到有效的 AI 服务 URL。"}
+
+    _cid = str(cluster_id) if cluster_id is not None else "default"
+    _idx = _url_idx_ctx.get(_cid, 0)
+    base_url = valid_urls[_idx % len(valid_urls)]
+    _url_idx_ctx[_cid] = _idx + 1
+
+    body: dict[str, Any] = {
+        "access": access,
+        "start": start,
+        "limit": limit,
+        "sort": sort,
+        "orderBy": order_by,
+    }
+    if name:
+        body["name"] = name
+    if image_type:
+        body["type"] = image_type
+    if accelerator_type:
+        body["acceleratorType"] = accelerator_type
+
+    try:
+        client = _get_http_client(timeout=30.0)
+        resp = await client.post(
+            _ai_url(base_url, "/ai/openapi/v2/image/images"),
+            json=body,
+            headers={"token": token, "Content-Type": "application/json"},
+            timeout=15.0,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+    except httpx.HTTPStatusError as exc:
+        return {
+            "error": True,
+            "message": (
+                f"获取镜像列表失败 (HTTP {exc.response.status_code})。"
+                f"详情: {exc.response.text[:500]}"
+            ),
+            "status_code": exc.response.status_code,
+        }
+    except Exception as exc:
+        return {"error": True, "message": f"获取镜像列表请求异常: {exc}"}
+
+    returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
+    doc = {
+        "url": "{aiUrls}/ai/openapi/v2/image/images",
+        "method": "POST",
+        "description": "获取可用的容器镜像列表，支持按名称、类型、加速器筛选和分页排序。",
+        "parameters": {
+            "format": "JSON",
+            "schema": {
+                "access": {"type": "string", "description": "镜像权限 public/private", "optional": False},
+                "order_by": {"type": "string", "description": "排序字段", "optional": True},
+                "sort": {"type": "string", "description": "排序方式", "optional": True},
+                "limit": {"type": "integer", "description": "每页数量", "optional": True},
+                "start": {"type": "integer", "description": "起始条数", "optional": True},
+                "name": {"type": "string", "description": "镜像名称", "optional": True},
+                "image_type": {"type": "string", "description": "镜像类型", "optional": True},
+                "accelerator_type": {"type": "string", "description": "加速器类型", "optional": True},
+                "cluster_id": {"type": "integer", "description": "集群 ID", "optional": True},
+            },
+        },
+        "returns": {"format": "JSON", "schema": returns_schema},
+    }
+    conn2 = get_db()
+    try:
+        conn2.execute(
+            "INSERT OR REPLACE INTO APIs(name, document) VALUES (?, ?)",
+            ("container_get_images", json.dumps(doc, ensure_ascii=False)),
+        )
+        conn2.commit()
+    finally:
+        conn2.close()
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -3591,7 +7462,7 @@ async def notebook_list_resources(
     finally:
         conn.close()
 
-    return _enrich_auth_error(result, username)
+    return result
 
 
 @mcp.tool()
@@ -3694,7 +7565,7 @@ async def notebook_create(
     finally:
         conn.close()
 
-    return _enrich_auth_error(result, username)
+    return result
 
 
 @mcp.tool()
@@ -3757,7 +7628,7 @@ async def notebook_start(
     finally:
         conn.close()
 
-    return _enrich_auth_error(result, username)
+    return result
 
 
 @mcp.tool()
@@ -3866,7 +7737,7 @@ async def notebook_list(
     finally:
         conn2.close()
 
-    return _enrich_auth_error(result, username)
+    return result
 
 
 @mcp.tool()
@@ -3964,7 +7835,7 @@ async def notebook_detail(
     finally:
         conn2.close()
 
-    return _enrich_auth_error(result, username)
+    return result
 
 
 @mcp.tool()
@@ -4064,7 +7935,7 @@ async def notebook_stop(
     finally:
         conn2.close()
 
-    return _enrich_auth_error(result, username)
+    return result
 
 
 @mcp.tool()
@@ -4162,7 +8033,7 @@ async def notebook_release(
     finally:
         conn2.close()
 
-    return _enrich_auth_error(result, username)
+    return result
 
 
 @mcp.tool()
@@ -4264,7 +8135,7 @@ async def notebook_rename(
     finally:
         conn2.close()
 
-    return _enrich_auth_error(result, username)
+    return result
 
 
 @mcp.tool()
@@ -4389,7 +8260,7 @@ async def notebook_list_images(
     finally:
         conn2.close()
 
-    return _enrich_auth_error(result, username)
+    return result
 
 
 @mcp.tool()
@@ -4493,7 +8364,7 @@ async def notebook_list_model_images(
     finally:
         conn2.close()
 
-    return _enrich_auth_error(result, username)
+    return result
 
 
 @mcp.tool()
@@ -4591,7 +8462,7 @@ async def notebook_query_jupyter_url(
     finally:
         conn2.close()
 
-    return _enrich_auth_error(result, username)
+    return result
 
 
 @mcp.tool()
@@ -4689,7 +8560,7 @@ async def notebook_query_custom_service_url(
     finally:
         conn2.close()
 
-    return _enrich_auth_error(result, username)
+    return result
 
 
 @mcp.tool()
@@ -4798,7 +8669,7 @@ async def notebook_start_custom_service(
     finally:
         conn2.close()
 
-    return _enrich_auth_error(result, username)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -4819,11 +8690,19 @@ def main() -> None:
 
     migrate_db()
 
+    # Set the max request body size to allow large file uploads
+    # h11 default is 16KB which would reject any body > 16KB
+    max_request_size = int(
+        os.environ.get("MCP_MAX_REQUEST_SIZE", 6 * 1024 * 1024 * 1024)
+    )
     mcp.run(
         transport="streamable-http",
         host=os.environ.get("MCP_HOST", "0.0.0.0"),
         port=int(os.environ.get("MCP_PORT", "8000")),
         path="/mcp/{username}",
+        uvicorn_config={
+            "h11_max_incomplete_event_size": max_request_size,
+        },
     )
 
 

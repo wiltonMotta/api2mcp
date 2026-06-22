@@ -161,8 +161,9 @@ class TestEfileListFiles:
         main, mock = env
         mock.get.side_effect = make_http_error(500, '{"code":"10001","msg":"server error"}')
         result = await main.efile_list_files()
-        assert result.get("error") is True
-        assert "500" in result.get("message", "")
+        # HTTP errors with non-10008 codes are returned as raw response
+        assert result.get("code") == "10001"
+        assert result.get("msg") == "server error"
 
     async def test_network_exception(self, env):
         main, mock = env
@@ -742,11 +743,12 @@ class TestEfileDownload:
         mock.get.return_value = MockResponse(
             content=file_bytes,
             headers={"content-type": "application/octet-stream",
-                     "content-disposition": 'attachment; filename="report.pdf"'},
+                     "content-disposition": 'attachment; filename="report.pdf"',
+                     "content-length": str(len(file_bytes))},
         )
         result = await main.efile_download(path="/home/test/report.pdf")
         assert result["file_name"] == "report.pdf"
-        assert result["file_content"] == base64.b64encode(file_bytes).decode()
+        assert result["file_content_b64"] == base64.b64encode(file_bytes).decode()
         assert result["file_size"] == len(file_bytes)
         assert result["content_type"] == "application/octet-stream"
 
@@ -755,11 +757,12 @@ class TestEfileDownload:
         zip_bytes = b"PK\x03\x04..."  # fake zip header
         mock.get.return_value = MockResponse(
             content=zip_bytes,
-            headers={"content-type": "application/zip"},
+            headers={"content-type": "application/zip",
+                     "content-length": str(len(zip_bytes))},
         )
         result = await main.efile_download(path="/home/test/mydir")
         assert result["content_type"] == "application/zip"
-        assert result["file_content"] == base64.b64encode(zip_bytes).decode()
+        assert result["file_content_b64"] == base64.b64encode(zip_bytes).decode()
         # File name derived from path when no Content-Disposition
         assert result["file_name"] == "mydir"
 
@@ -828,7 +831,8 @@ class TestEfileDownload:
             headers={"content-type": "application/octet-stream"},
         )
         await main.efile_download(path="/f")
-        assert mock.get.call_args.kwargs.get("timeout") == 120.0
+        # The code uses 300.0s timeout for download (inline path)
+        assert mock.get.call_args.kwargs.get("timeout") == 300.0
 
     async def test_no_efile_urls(self, env):
         main, mock = env
@@ -847,7 +851,7 @@ class TestEfileDownload:
             headers={"content-type": "application/octet-stream"},
         )
         result = await main.efile_download(path="/f", clusterId=2)
-        assert result["file_content"] is not None
+        assert result.get("file_content_b64") is not None
         assert "efile-second.scnet.cn" in _get_url(mock)
 
 

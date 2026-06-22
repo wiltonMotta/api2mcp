@@ -13,7 +13,12 @@
       "Bash(echo \"Server PID: $!\")",
       "Bash(echo \"exit: $?\")",
       "Bash(nginx -v)",
-      "Bash(echo \"port check exit: $?\")"
+      "Bash(echo \"port check exit: $?\")",
+      "Bash(su *)",
+      "Bash(python3 *)",
+      "Bash(git checkout *)",
+      "Bash(grep *)",
+      "Bash(pip show *)"
     ]
   }
 }
