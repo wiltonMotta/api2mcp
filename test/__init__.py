@@ -18,8 +18,8 @@ def seed_test_data(db_path: str) -> None:
     conn.execute("DELETE FROM cluster_url WHERE clusterId IN (?, ?)", (1, 2))
 
     conn.execute(
-        "INSERT OR REPLACE INTO users(userName, acToken, created_at, updated_at) VALUES (?, ?, ?, ?)",
-        (TEST_USER, "ac-token-xxx", now, now),
+        "INSERT OR REPLACE INTO users(userName, accessKey, acToken, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+        (TEST_USER, TEST_USER, "ac-token-xxx", now, now),
     )
     conn.execute(
         "INSERT OR REPLACE INTO user_cluster(userName, clusterId, clusterName, homePath, token, "

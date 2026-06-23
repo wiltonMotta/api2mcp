@@ -1,7 +1,9 @@
 """SCNet OpenAPI MCP Server.
 
 StreamableHTTP MCP server with AK/SK-based user authentication.
-Each user connects at /mcp/{userName} and authenticates at /auth/{userName}.
+Each user connects at /mcp/{accessKey} and authenticates at /auth/{accessKey}.
+The accessKey (AK) identifies the user session; the auth page collects the
+SCNet userName and Secret Key (SK) for credential exchange.
 """
 
 from __future__ import annotations
@@ -151,10 +153,12 @@ TYPE_MAP: dict[str, type] = {
 
 MIGRATION_SQL = """
 CREATE TABLE IF NOT EXISTS users (
-    userName   TEXT PRIMARY KEY,r
+    userName   TEXT,
+    accessKey  TEXT UNIQUE,
     acToken    TEXT,
     created_at datetime,
-    updated_at datetime
+    updated_at datetime,
+    PRIMARY KEY (userName)
 );
 CREATE TABLE IF NOT EXISTS user_cluster (
     userName        TEXT,
@@ -195,7 +199,7 @@ AUTH_PAGE_HTML = """\
   .card {{ background: #fff; border-radius: 10px; padding: 32px;
           box-shadow: 0 1px 3px rgba(0,0,0,.08); }}
   h1 {{ font-size: 22px; margin: 0 0 8px; }}
-  .user {{ color: #6b7280; font-size: 14px; margin-bottom: 24px; }}
+  .access-key {{ color: #6b7280; font-size: 14px; margin-bottom: 24px; }}
   label {{ display: block; margin-bottom: 16px; font-size: 14px; font-weight: 500; color: #374151; }}
   input {{ width: 100%; padding: 10px 12px; font-size: 15px; box-sizing: border-box;
           border: 1px solid #d1d5db; border-radius: 6px; margin-top: 4px; }}
@@ -212,18 +216,18 @@ AUTH_PAGE_HTML = """\
 <body>
 <div class="card">
   <h1>SCNet Authentication</h1>
-  <p class="user">User: <strong>{username}</strong></p>
-  <p class="info">Enter your SCNet Access Key and Secret Key.
-     Find them in the personal center under <strong>Access Control</strong>.</p>
-  <form method="POST" action="/auth/{username}">
-    <label>Access Key
-      <input type="text" name="accessKey" required autocomplete="off" placeholder="Your AK">
+  <p class="access-key">Access Key: <strong>{access_key}</strong></p>
+  <p class="info">Enter your SCNet userName and Secret Key.
+     Find the Secret Key in the personal center under <strong>Access Control</strong>.</p>
+  <form method="POST" action="/auth/{access_key}">
+    <label>SCNet userName
+      <input type="text" name="userName" required placeholder="Your SCNet userName">
     </label>
     <label>Secret Key
       <input type="password" name="secretKey" required placeholder="Your SK">
     </label>{error_html}
     <button type="submit">Authenticate</button>
-    <a class="btn-link" href='https://www.scnet.cn/ui/console/index.html#/personal/auth-manage' target="_blank">Get Access Key & Secret Key</a>
+    <a class="btn-link" href='https://www.scnet.cn/ui/console/index.html#/personal/auth-manage' target="_blank">Get Secret Key</a>
   </form>
 </div>
 </body>
@@ -323,6 +327,7 @@ def get_db() -> sqlite3.Connection:
 
 def migrate_db() -> None:
     conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
     try:
         conn.executescript(MIGRATION_SQL)
         # Add columns that may not exist in older databases
@@ -332,12 +337,25 @@ def migrate_db() -> None:
             "ALTER TABLE user_cluster ADD COLUMN JobManagerid TEXT",
             "ALTER TABLE user_cluster ADD COLUMN JobManagertext TEXT",
             "ALTER TABLE user_cluster ADD COLUMN JobManagerPort TEXT",
+            "ALTER TABLE users ADD COLUMN accessKey TEXT",
         ]:
             try:
                 conn.execute(col_sql)
             except sqlite3.OperationalError:
                 pass
-        conn.commit()
+        # Migrate existing userName→accessKey: copy userName into accessKey
+        try:
+            existing = conn.execute(
+                "SELECT userName FROM users WHERE accessKey IS NULL AND userName IS NOT NULL"
+            ).fetchall()
+            for row in existing:
+                conn.execute(
+                    "UPDATE users SET accessKey = ? WHERE userName = ?",
+                    (row[0], row[0]),
+                )
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
     finally:
         conn.close()
 
@@ -349,8 +367,8 @@ def migrate_db() -> None:
 AUTH_BASE_URL = "https://c-2056205187675406338.qdai.scnet.cn:58043"
 
 
-def check_auth(username: str) -> sqlite3.Row | dict:
-    """Check whether a user is authenticated.
+def check_auth(access_key: str) -> sqlite3.Row | dict:
+    """Check whether a user (identified by *accessKey*) is authenticated.
 
     Returns the database ``Row`` on success (with a valid ``acToken``),
     or an error ``dict`` with ``error=True``, ``message``, and
@@ -359,7 +377,7 @@ def check_auth(username: str) -> sqlite3.Row | dict:
     conn = get_db()
     try:
         row = conn.execute(
-            "SELECT acToken FROM users WHERE userName = ?", (username,)
+            "SELECT userName, acToken FROM users WHERE accessKey = ?", (access_key,)
         ).fetchone()
     finally:
         conn.close()
@@ -368,10 +386,9 @@ def check_auth(username: str) -> sqlite3.Row | dict:
         return {
             "error": True,
             "message": (
-                f"用户 '{username}' 未认证。"
-                "请先访问认证页面获取访问凭证。"
+                f"用户未认证。请先访问认证页面获取访问凭证。"
             ),
-            "auth_url": f"{AUTH_BASE_URL}/auth/{username}",
+            "auth_url": f"{AUTH_BASE_URL}/auth/{access_key}",
         }
     return row
 
@@ -446,11 +463,30 @@ def _get_default_token(username: str) -> dict:
         conn.close()
 
 
-def get_current_username() -> str:
+def _get_current_access_key() -> str:
+    """Return the accessKey from the URL path segment."""
     request = _current_http_request.get()
     if request is None:
         raise RuntimeError("No HTTP request context — not running in streamable-http mode")
-    return request.path_params.get("username", "")
+    return request.path_params.get("accessKey", "")
+
+
+def get_current_username() -> str:
+    """Resolve the current accessKey → userName via DB lookup.
+
+    Returns the SCNet userName if found, empty string otherwise.
+    """
+    access_key = _get_current_access_key()
+    if not access_key:
+        return ""
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT userName FROM users WHERE accessKey = ?", (access_key,)
+        ).fetchone()
+    finally:
+        conn.close()
+    return row["userName"] if row else ""
 
 
 def hmac_sha256_sign(secret_key: str, payload: dict) -> str:
@@ -485,13 +521,24 @@ def _is_token_expired_response(resp_data: dict) -> bool:
     return str(resp_data.get("code", "")) == "10008"
 
 
-def _build_auth_error(username: str, reason: str = "Token 已过期且无法自动续约") -> dict:
+def _build_auth_error(access_key: str, reason: str = "Token 已过期且无法自动续约") -> dict:
     """Build a uniform "please re-authenticate" error response."""
     return {
         "error": True,
         "message": f"认证凭证已失效：{reason}。请重新认证。",
-        "auth_url": f"{AUTH_BASE_URL}/auth/{username}",
+        "auth_url": f"{AUTH_BASE_URL}/auth/{access_key}",
     }
+
+
+def _maybe_add_auth_url(data: Any, access_key: str) -> Any:
+    """If *data* is a dict with SCNet code 10008, inject ``auth_url`` into it.
+
+    This ensures that any raw SCNet response containing a token-expiry error
+    carries a retry URL for the client to navigate to.
+    """
+    if isinstance(data, dict) and data.get("code") == "10008":
+        data["auth_url"] = f"{AUTH_BASE_URL}/auth/{access_key}"
+    return data
 
 
 async def _renew_token_via_api(old_token: str) -> tuple[bool, str]:
@@ -687,9 +734,12 @@ async def _call_scnet_with_renewal(
     new_token = result
     req_headers["token"] = new_token
 
+    # Resolve accessKey from HTTP request context for auth_url
+    access_key = _get_current_access_key()
+
     try:
         data = await _do_request(req_headers)
-        return data
+        return _maybe_add_auth_url(data, access_key)
     except httpx.HTTPStatusError as exc:
         try:
             data = exc.response.json()
@@ -700,8 +750,9 @@ async def _call_scnet_with_renewal(
             }
         # If the NEW token is also expired (shouldn't happen normally)
         if _is_token_expired_response(data):
-            return _build_auth_error(username, "续约后的 token 仍然失效")
-        return data
+            return _build_auth_error(access_key, "续约后的 token 仍然失效")
+        # Retry succeeded but response still has non-zero code — ensure auth_url
+        return _maybe_add_auth_url(data, access_key)
     except Exception as exc:
         return {"error": True, "message": f"重试请求异常: {exc}"}
 
@@ -860,31 +911,32 @@ def register_apis(server: FastMCP, db_path: str = DB_PATH) -> int:
 # Custom HTTP routes — auth page
 # ---------------------------------------------------------------------------
 
-@mcp.custom_route("/auth/{username}", methods=["GET"])
+@mcp.custom_route("/auth/{accessKey}", methods=["GET"])
 async def auth_page(request: Request) -> HTMLResponse:
-    username = html_mod.escape(request.path_params["username"])
-    return HTMLResponse(AUTH_PAGE_HTML.format(username=username, error_html=""))
+    access_key = html_mod.escape(request.path_params["accessKey"])
+    return HTMLResponse(AUTH_PAGE_HTML.format(access_key=access_key, error_html=""))
 
 
-@mcp.custom_route("/auth/{username}", methods=["POST"])
+@mcp.custom_route("/auth/{accessKey}", methods=["POST"])
 async def auth_submit(request: Request) -> HTMLResponse:
-    username = request.path_params["username"]
-    safe_username = html_mod.escape(username)
+    access_key = request.path_params["accessKey"]
+    safe_access_key = html_mod.escape(access_key)
 
     form = await request.form()
-    access_key = form.get("accessKey", "").strip()
+    username = form.get("userName", "").strip()
     secret_key = form.get("secretKey", "").strip()
 
-    if not access_key or not secret_key:
+    if not username or not secret_key:
         return HTMLResponse(
             AUTH_PAGE_HTML.format(
-                username=safe_username,
-                error_html='<p class="error">Both Access Key and Secret Key are required.</p>',
+                access_key=safe_access_key,
+                error_html='<p class="error">SCNet userName and Secret Key are required.</p>',
             ),
             status_code=400,
         )
 
-    # 1. Get tokens from SCNet using AK/SK
+    # 1. Verify: call SCNet API with AK + SK + userName to get tokens
+    #    The API validates that the AK belongs to the specified userName
     timestamp = str(int(time_mod.time()))
     signature = hmac_sha256_sign(secret_key, {
         "accessKey": access_key, "timestamp": timestamp, "user": username,
@@ -910,24 +962,21 @@ async def auth_submit(request: Request) -> HTMLResponse:
 
             if "不存在" in api_msg:
                 hint = (
-                    "The Access Key / Secret Key pair was not found. "
-                    "Please verify: (1) The keys were copied correctly from the "
-                    "Access Control page without extra spaces or line breaks. "
-                    "(2) Access Key goes in the first field and Secret Key in the second. "
-                    "(3) The keys have not been revoked or regenerated."
+                    "Secret Key not found. "
+                    "Please verify: (1) The keys were copied correctly without extra spaces. "
+                    "(2) userName goes in the first field and Secret Key in the second."
                 )
             elif "非本人" in api_msg:
                 hint = (
-                    "The AK/SK you provided belong to a different SCNet user, "
-                    f"not <strong>{html_mod.escape(username)}</strong>. "
-                    "Please use the AK/SK that matches this account."
+                    "The Secret Key does not match the specified userName. "
+                    f"Please use the Secret Key that belongs to <strong>{html_mod.escape(username)}</strong>."
                 )
             else:
                 hint = f"SCNet API error: {html_mod.escape(api_msg)} (code={api_code})"
 
             return HTMLResponse(
                 ERROR_PAGE_HTML.format(
-                    username=safe_username,
+                    username=safe_access_key,
                     message=hint,
                 ),
                 status_code=400,
@@ -935,7 +984,7 @@ async def auth_submit(request: Request) -> HTMLResponse:
     except httpx.HTTPStatusError as exc:
         return HTMLResponse(
             ERROR_PAGE_HTML.format(
-                username=safe_username,
+                username=safe_access_key,
                 message=f"SCNet API error (HTTP {exc.response.status_code}): "
                         f"{exc.response.text[:300]}",
             ),
@@ -944,13 +993,13 @@ async def auth_submit(request: Request) -> HTMLResponse:
     except Exception as exc:
         return HTMLResponse(
             ERROR_PAGE_HTML.format(
-                username=safe_username,
+                username=safe_access_key,
                 message=f"Request failed: {html_mod.escape(str(exc))}",
             ),
             status_code=502,
         )
 
-    # 2. Parse clusters from response
+    # 2. Store AK-username binding + cluster tokens in DB
     clusters = token_data.get("data", token_data)
     if isinstance(clusters, dict):
         clusters = clusters.get("clusters", [])
@@ -968,10 +1017,11 @@ async def auth_submit(request: Request) -> HTMLResponse:
             token = cluster.get("token")
 
             if cid == 0 or cname == "ac":
+                # Store AK-username binding + acToken
                 conn.execute(
-                    "INSERT OR REPLACE INTO users(userName, acToken, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?)",
-                    (username, token, now, now),
+                    "INSERT OR REPLACE INTO users(userName, accessKey, acToken, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (username, access_key, token, now, now),
                 )
             else:
                 conn.execute(
@@ -995,7 +1045,7 @@ async def auth_submit(request: Request) -> HTMLResponse:
     conn = get_db()
     try:
         user_row = conn.execute(
-            "SELECT acToken FROM users WHERE userName = ?", (username,)
+            "SELECT acToken FROM users WHERE accessKey = ?", (access_key,)
         ).fetchone()
     finally:
         conn.close()
@@ -1003,9 +1053,9 @@ async def auth_submit(request: Request) -> HTMLResponse:
     if user_row is None:
         return HTMLResponse(
             ERROR_PAGE_HTML.format(
-                username=safe_username,
+                username=safe_access_key,
                 message="Authentication failed: no platform token (ac) was returned. "
-                        "Make sure your Access Key and Secret Key belong to this user.",
+                        "Make sure your Secret Key belongs to this userName.",
             ),
             status_code=400,
         )
@@ -1110,7 +1160,7 @@ async def auth_submit(request: Request) -> HTMLResponse:
         cluster_info = ""
 
     return HTMLResponse(
-        SUCCESS_PAGE_HTML.format(username=safe_username, cluster_info=cluster_info)
+        SUCCESS_PAGE_HTML.format(username=html_mod.escape(username), cluster_info=cluster_info)
     )
 
 
@@ -1172,11 +1222,11 @@ async def get_user_info() -> dict:
     """获取当前用户的 SCNet 账号信息。
 
     返回国家、语言、时区、账号状态、余额等基本信息。
-    调用前需先通过 /auth/{username} 完成 AK/SK 认证。
+    调用前需先通过 /auth/{accessKey} 完成 SCNet userName 和 SK 认证。
     """
     username = get_current_username()
 
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -1221,7 +1271,7 @@ async def get_user_info() -> dict:
     finally:
         conn.close()
 
-    return data
+    return _maybe_add_auth_url(data, _get_current_access_key())
 
 
 @mcp.tool()
@@ -1233,7 +1283,7 @@ async def hpc_list_available_partitions() -> list[dict]:
     """
     username = get_current_username()
 
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return [auth_result]
 
@@ -1407,7 +1457,7 @@ async def hpc_submit_job(
             }
 
     # 1. Auth check
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -1677,7 +1727,7 @@ async def hpc_submit_job(
         result["token"] = token
         result["hpcUrls"] = hpc_urls
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -1693,7 +1743,7 @@ async def hpc_get_running_job_detail(
     username = get_current_username()
 
     # 1. Auth check
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -1823,7 +1873,7 @@ async def hpc_get_running_job_detail(
     finally:
         conn.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -1839,7 +1889,7 @@ async def hpc_get_history_job_detail(
     username = get_current_username()
 
     # 1. Auth check
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -1951,7 +2001,7 @@ async def hpc_get_history_job_detail(
     finally:
         conn.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -1967,7 +2017,7 @@ async def set_default_cluster(
     """
     username = get_current_username()
 
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -2075,10 +2125,11 @@ async def hpc_list_history_jobs(
     username = get_current_username()
 
     # 1. Auth check — need acToken from users table (AC token, not cluster token)
+    access_key = _get_current_access_key()
     conn = get_db()
     try:
         ac_row = conn.execute(
-            "SELECT acToken FROM users WHERE userName = ?", (username,)
+            "SELECT acToken FROM users WHERE accessKey = ?", (access_key,)
         ).fetchone()
     finally:
         conn.close()
@@ -2087,10 +2138,10 @@ async def hpc_list_history_jobs(
         return {
             "error": True,
             "message": (
-                f"用户 '{username}' 未认证。"
+                "用户未认证。"
                 "请先访问认证页面获取访问凭证。"
             ),
-            "auth_url": f"{AUTH_BASE_URL}/auth/{username}",
+            "auth_url": f"{AUTH_BASE_URL}/auth/{access_key}",
         }
 
     ac_token = ac_row["acToken"]
@@ -2186,7 +2237,7 @@ async def hpc_list_history_jobs(
     finally:
         conn.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -2209,10 +2260,11 @@ async def hpc_list_running_jobs(
     username = get_current_username()
 
     # 1. Auth check
+    access_key = _get_current_access_key()
     conn = get_db()
     try:
         ac_row = conn.execute(
-            "SELECT acToken FROM users WHERE userName = ?", (username,)
+            "SELECT acToken FROM users WHERE accessKey = ?", (access_key,)
         ).fetchone()
     finally:
         conn.close()
@@ -2221,10 +2273,10 @@ async def hpc_list_running_jobs(
         return {
             "error": True,
             "message": (
-                f"用户 '{username}' 未认证。"
+                "用户未认证。"
                 "请先访问认证页面获取访问凭证。"
             ),
-            "auth_url": f"{AUTH_BASE_URL}/auth/{username}",
+            "auth_url": f"{AUTH_BASE_URL}/auth/{access_key}",
         }
 
     ac_token = ac_row["acToken"]
@@ -2386,7 +2438,7 @@ async def hpc_list_running_jobs(
     finally:
         conn.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -2402,7 +2454,7 @@ async def hpc_cancel_job(
     username = get_current_username()
 
     # 1. Auth check
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -2533,7 +2585,7 @@ async def hpc_cancel_job(
     finally:
         conn.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -2547,7 +2599,7 @@ async def hpc_query_job_state(
     """
     username = get_current_username()
 
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -2643,7 +2695,7 @@ async def hpc_query_job_state(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -2657,7 +2709,7 @@ async def hpc_query_core_num(
     """
     username = get_current_username()
 
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -2752,7 +2804,7 @@ async def hpc_query_core_num(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -2766,7 +2818,7 @@ async def hpc_query_queue_jobs(
     """
     username = get_current_username()
 
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -2862,7 +2914,7 @@ async def hpc_query_queue_jobs(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -2876,7 +2928,7 @@ async def hpc_query_user_quota(
     """
     username = get_current_username()
 
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -2971,7 +3023,7 @@ async def hpc_query_user_quota(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -2985,7 +3037,7 @@ async def hpc_query_used_time(
     """
     username = get_current_username()
 
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -3080,7 +3132,7 @@ async def hpc_query_used_time(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -3102,7 +3154,7 @@ async def efile_list_files(
     username = get_current_username()
 
     # 1. Auth check
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -3249,7 +3301,7 @@ async def efile_list_files(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -3260,7 +3312,7 @@ async def efile_touch(
     """在 HPC 集群文件系统上创建空文件。"""
     username = get_current_username()
 
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -3344,7 +3396,7 @@ async def efile_touch(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -3362,7 +3414,7 @@ async def efile_check_permission(
             "message": f"无效的权限类型: {permission_action}，有效值为 READ/WRITE/EXECUTE",
         }
 
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -3447,7 +3499,7 @@ async def efile_check_permission(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -3460,7 +3512,7 @@ async def efile_move(
     """在 HPC 集群文件系统上移动文件，支持批量移动（多个源文件逗号分隔）。"""
     username = get_current_username()
 
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -3550,7 +3602,7 @@ async def efile_move(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -3563,7 +3615,7 @@ async def efile_copy(
     """在 HPC 集群文件系统上复制文件，支持批量复制（多个源文件逗号分隔）。"""
     username = get_current_username()
 
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -3653,7 +3705,7 @@ async def efile_copy(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -3665,7 +3717,7 @@ async def efile_rename(
     """重命名 HPC 集群文件系统上的文件。"""
     username = get_current_username()
 
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -3750,7 +3802,7 @@ async def efile_rename(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -3762,7 +3814,7 @@ async def efile_delete(
     """删除 HPC 集群文件系统上的文件或文件夹，支持批量删除。"""
     username = get_current_username()
 
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -3847,7 +3899,7 @@ async def efile_delete(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -3858,7 +3910,7 @@ async def efile_exist(
     """判断指定的文件或文件夹是否存在于 HPC 集群文件系统中。"""
     username = get_current_username()
 
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -3942,7 +3994,7 @@ async def efile_exist(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -3954,7 +4006,7 @@ async def efile_folder_create(
     """在 HPC 集群文件系统上创建文件夹。"""
     username = get_current_username()
 
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -4039,7 +4091,7 @@ async def efile_folder_create(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -4052,7 +4104,7 @@ async def efile_preview_file(
     """预览 HPC 集群上的文本文件内容，支持分页读取。"""
     username = get_current_username()
 
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -4142,7 +4194,7 @@ async def efile_preview_file(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -4160,7 +4212,7 @@ async def efile_upload(
     """
     username = get_current_username()
 
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -4255,7 +4307,7 @@ async def efile_upload(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -4271,7 +4323,7 @@ async def efile_download(
     """
     username = get_current_username()
 
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -4441,7 +4493,7 @@ async def efile_download_chunk(
     """
     username = get_current_username()
 
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -4605,7 +4657,7 @@ async def efile_get_download_link(
     """
     username = get_current_username()
 
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -4688,7 +4740,7 @@ async def efile_open_share(
     """
     username = get_current_username()
 
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -4777,7 +4829,7 @@ async def efile_open_share(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -4788,7 +4840,7 @@ async def efile_close_share(
     """关闭指定文件的分享链接。"""
     username = get_current_username()
 
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -4876,7 +4928,7 @@ async def efile_close_share(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -4892,7 +4944,7 @@ async def efile_async_copy(
     """异步复制文件/文件夹。支持批量提交（最多 100 个任务），返回 taskId 用于查询进度和取消。"""
     username = get_current_username()
 
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -4989,7 +5041,7 @@ async def efile_async_copy(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -5004,7 +5056,7 @@ async def efile_async_move(
     """异步移动文件/文件夹。支持批量提交（最多 100 个任务），返回 taskId 用于查询进度和取消。"""
     username = get_current_username()
 
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -5100,7 +5152,7 @@ async def efile_async_move(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -5115,7 +5167,7 @@ async def efile_async_delete(
     """异步删除文件/文件夹。支持批量提交（最多 100 个任务），返回 taskId 用于查询进度和取消。"""
     username = get_current_username()
 
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -5211,7 +5263,7 @@ async def efile_async_delete(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -5225,7 +5277,7 @@ async def efile_async_task_cancel(
     """取消异步文件操作任务（复制/移动/删除）。已完成或已失败的任务无法取消。"""
     username = get_current_username()
 
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -5321,7 +5373,7 @@ async def efile_async_task_cancel(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -5335,7 +5387,7 @@ async def efile_async_task_list(
     """查询异步文件操作任务的进度和状态。任务结束后服务端缓存信息 24 小时。"""
     username = get_current_username()
 
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -5431,7 +5483,7 @@ async def efile_async_task_list(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -5454,7 +5506,7 @@ async def efile_chunk_upload(
     """
     username = get_current_username()
 
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -5576,7 +5628,7 @@ async def efile_chunk_upload(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -5595,7 +5647,7 @@ async def efile_merge_file(
     """
     username = get_current_username()
 
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -5700,7 +5752,7 @@ async def efile_merge_file(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -5786,7 +5838,7 @@ async def efile_batch_chunk_upload(
 
     username = get_current_username()
 
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -5984,7 +6036,7 @@ async def container_create(
     """
     username = get_current_username()
 
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -6119,7 +6171,7 @@ async def container_create(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -6130,7 +6182,7 @@ async def container_start(
     """重新启动停止、失败等状态的容器实例。"""
     username = get_current_username()
 
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -6218,7 +6270,7 @@ async def container_start(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -6229,7 +6281,7 @@ async def container_stop(
     """批量停止容器实例。"""
     username = get_current_username()
 
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -6324,7 +6376,7 @@ async def container_stop(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -6335,7 +6387,7 @@ async def container_delete(
     """批量删除容器实例。"""
     username = get_current_username()
 
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -6429,7 +6481,7 @@ async def container_delete(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -6442,7 +6494,7 @@ async def container_execute(
     """对容器实例批量执行脚本。"""
     username = get_current_username()
 
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -6536,7 +6588,7 @@ async def container_execute(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -6552,7 +6604,7 @@ async def container_query_list(
     """查询容器实例列表，支持按状态、类型、名称筛选和分页排序。"""
     username = get_current_username()
 
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -6658,7 +6710,7 @@ async def container_query_list(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -6669,7 +6721,7 @@ async def container_query_url(
     """获取容器实例的访问 URL（如 JupyterLab 地址）。"""
     username = get_current_username()
 
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -6756,7 +6808,7 @@ async def container_query_url(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -6767,7 +6819,7 @@ async def container_query_detail(
     """查询容器实例的详细信息，包含配置、状态、挂载、端口等完整数据。"""
     username = get_current_username()
 
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -6854,7 +6906,7 @@ async def container_query_detail(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -6868,7 +6920,7 @@ async def container_update_resource(
     """更新容器实例的资源规格（CPU/GPU/内存）。仅非运行状态可修改。"""
     username = get_current_username()
 
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -6964,7 +7016,7 @@ async def container_update_resource(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -6976,7 +7028,7 @@ async def container_query_resources(
     """查询指定资源分组的节点资源限额（单节点 CPU 核数、GPU 数、内存等）。"""
     username = get_current_username()
 
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -7065,7 +7117,7 @@ async def container_query_resources(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -7075,7 +7127,7 @@ async def container_query_resource_group(
     """获取当前用户可用的资源分组列表，按加速器类型（gpu/dcu/mlu/cpu）分组返回。"""
     username = get_current_username()
 
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -7161,7 +7213,7 @@ async def container_query_resource_group(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -7171,7 +7223,7 @@ async def container_query_allowed_mount_dir(
     """获取当前用户被授权允许挂载的目录列表。"""
     username = get_current_username()
 
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -7257,7 +7309,7 @@ async def container_query_allowed_mount_dir(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -7278,7 +7330,7 @@ async def container_get_images(
     """
     username = get_current_username()
 
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -7387,7 +7439,7 @@ async def container_get_images(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 # ---------------------------------------------------------------------------
@@ -7406,7 +7458,7 @@ async def notebook_list_resources(
     需要先完成 AK/SK 认证。返回的 clusterId、resourceGroupCode、resourceType 可用于 notebook_create。
     """
     username = get_current_username()
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -7462,7 +7514,7 @@ async def notebook_list_resources(
     finally:
         conn.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -7484,7 +7536,7 @@ async def notebook_create(
     创建是异步操作，返回的 taskId 可用于跟踪创建进度。返回的 notebookId 可用于 notebook_start、notebook_detail 等后续操作。
     """
     username = get_current_username()
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -7565,7 +7617,7 @@ async def notebook_create(
     finally:
         conn.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -7577,7 +7629,7 @@ async def notebook_start(
     需要先完成 AK/SK 认证。实例状态应为 Terminated 或 Failed。启动成功后可通过 notebook_query_jupyter_url 获取 Jupyter 访问地址。
     """
     username = get_current_username()
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -7628,7 +7680,7 @@ async def notebook_start(
     finally:
         conn.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -7644,7 +7696,7 @@ async def notebook_list(
     需要先完成 AK/SK 认证。返回的 records[].id 可作为其他 notebook 工具的 notebook_id 入参。
     """
     username = get_current_username()
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -7737,7 +7789,7 @@ async def notebook_list(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -7750,7 +7802,7 @@ async def notebook_detail(
     需要先完成 AK/SK 认证。返回的 notebookStatus 可用于判断实例是否可操作，customizePort 和 command 可用于 notebook_start_custom_service。
     """
     username = get_current_username()
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -7835,7 +7887,7 @@ async def notebook_detail(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -7849,7 +7901,7 @@ async def notebook_stop(
     需要先完成 AK/SK 认证。实例状态应为 Running 或 Restarting。关机后（状态变为 Terminated）可调用 notebook_start 重新开机。
     """
     username = get_current_username()
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -7935,7 +7987,7 @@ async def notebook_stop(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -7948,7 +8000,7 @@ async def notebook_release(
     需要先完成 AK/SK 认证。释放操作不可逆，请确认数据已备份。
     """
     username = get_current_username()
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -8033,7 +8085,7 @@ async def notebook_release(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -8047,7 +8099,7 @@ async def notebook_rename(
     需要先完成 AK/SK 认证。
     """
     username = get_current_username()
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -8135,7 +8187,7 @@ async def notebook_rename(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -8155,7 +8207,7 @@ async def notebook_list_images(
     需要先完成 AK/SK 认证。返回的 path、version、imageSize 可用于 notebook_create。
     """
     username = get_current_username()
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -8260,7 +8312,7 @@ async def notebook_list_images(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -8276,7 +8328,7 @@ async def notebook_list_model_images(
     返回的 path、version、imageSize 可用于 notebook_create。
     """
     username = get_current_username()
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -8364,7 +8416,7 @@ async def notebook_list_model_images(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -8377,7 +8429,7 @@ async def notebook_query_jupyter_url(
     需要先完成 AK/SK 认证。实例需处于 Running 状态。若 status 为 inactive，请先调用 notebook_start 开机。
     """
     username = get_current_username()
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -8462,7 +8514,7 @@ async def notebook_query_jupyter_url(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -8475,7 +8527,7 @@ async def notebook_query_custom_service_url(
     需要先调用 notebook_start_custom_service 启动自定义服务。若 status 为 inactive，表示服务不可访问。
     """
     username = get_current_username()
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -8560,7 +8612,7 @@ async def notebook_query_custom_service_url(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 @mcp.tool()
@@ -8578,7 +8630,7 @@ async def notebook_start_custom_service(
     只要 code === "0"，都应调用 notebook_query_custom_service_url 查询实际访问地址。
     """
     username = get_current_username()
-    auth_result = check_auth(username)
+    auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
 
@@ -8669,7 +8721,7 @@ async def notebook_start_custom_service(
     finally:
         conn2.close()
 
-    return result
+    return _maybe_add_auth_url(result, _get_current_access_key())
 
 
 # ---------------------------------------------------------------------------
@@ -8699,7 +8751,7 @@ def main() -> None:
         transport="streamable-http",
         host=os.environ.get("MCP_HOST", "0.0.0.0"),
         port=int(os.environ.get("MCP_PORT", "8000")),
-        path="/mcp/{username}",
+        path="/mcp/{accessKey}",
         uvicorn_config={
             "h11_max_incomplete_event_size": max_request_size,
         },

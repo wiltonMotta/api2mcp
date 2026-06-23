@@ -19,7 +19,7 @@ fi
 # Start new server
 cd "$DIR"
 echo "Starting MCP server on port $PORT..."
-env MCP_PORT=$PORT nohup $PYTHON main.py > /Users/apple/claude/log/mcp_server.log 2>&1 &
+env MCP_PORT=$PORT nohup $PYTHON main.py > /tmp/mcp_server.log 2>&1 &
 
 sleep 3
 if lsof -ti :$PORT >/dev/null 2>&1; then
@@ -27,6 +27,6 @@ if lsof -ti :$PORT >/dev/null 2>&1; then
     echo "MCP server started (PID $PID) on port $PORT."
 else
     echo "ERROR: Server failed to start. Check /Users/apple/claude/log/mcp_server.log"
-    tail -30 /Users/apple/claude/log/mcp_server.log
+    tail -30 /tmp/mcp_server.log
     exit 1
 fi

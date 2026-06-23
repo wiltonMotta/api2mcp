@@ -22,10 +22,12 @@ os.environ["MCP_DB_PATH"] = _MODULE_DB_PATH
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
-    userName   TEXT PRIMARY KEY,
+    userName   TEXT,
+    accessKey  TEXT UNIQUE,
     acToken    TEXT,
     created_at datetime,
-    updated_at datetime
+    updated_at datetime,
+    PRIMARY KEY (userName)
 );
 CREATE TABLE IF NOT EXISTS user_cluster (
     userName        TEXT,
@@ -87,8 +89,8 @@ def _seed_test_data(db_path: str) -> None:
     conn.execute("DELETE FROM cluster_url WHERE clusterId IN (?, ?)", (TEST_CLUSTER_ID, 2))
 
     conn.execute(
-        "INSERT OR REPLACE INTO users(userName, acToken, created_at, updated_at) VALUES (?, ?, ?, ?)",
-        (TEST_USER, "ac-token-xxx", now, now),
+        "INSERT OR REPLACE INTO users(userName, accessKey, acToken, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+        (TEST_USER, TEST_USER, "ac-token-xxx", now, now),
     )
     # Default cluster
     conn.execute(
@@ -126,7 +128,7 @@ def set_username():
     from fastmcp.server.http import _current_http_request
 
     mock_request = MagicMock()
-    mock_request.path_params = {"username": TEST_USER}
+    mock_request.path_params = {"accessKey": TEST_USER}
 
     token = _current_http_request.set(mock_request)
     yield
