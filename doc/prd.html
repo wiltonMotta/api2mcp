@@ -1,0 +1,1539 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SCNet MCP Server — PRD</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans SC', sans-serif;
+            line-height: 1.7;
+            color: #1a1a2e;
+            max-width: 960px;
+            margin: 0 auto;
+            padding: 40px 24px;
+            background: #f8f9fa;
+        }
+        .container {
+            background: #ffffff;
+            padding: 48px 56px;
+            border-radius: 12px;
+            box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+        }
+        h1 {
+            color: #1a1a2e;
+            border-bottom: 3px solid #4361ee;
+            padding-bottom: 16px;
+            margin-top: 0;
+            font-size: 2em;
+        }
+        h2 {
+            color: #2d3436;
+            border-bottom: 2px solid #e0e0e0;
+            padding-bottom: 8px;
+            margin-top: 40px;
+        }
+        h3 { color: #2d3436; margin-top: 28px; }
+        h4 { color: #555; }
+        table {
+            border-collapse: collapse;
+            width: 100%;
+            margin: 16px 0 24px;
+            font-size: 0.94em;
+        }
+        th, td {
+            border: 1px solid #ddd;
+            padding: 10px 14px;
+            text-align: left;
+        }
+        th {
+            background: #4361ee;
+            color: white;
+            font-weight: 600;
+        }
+        tr:nth-child(even) { background: #f8f9ff; }
+        tr:hover { background: #eef1ff; }
+        code {
+            background: #f0f0f5;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+            font-size: 0.9em;
+            color: #e17055;
+        }
+        pre {
+            background: #1e1e2e;
+            color: #cdd6f4;
+            padding: 18px 22px;
+            border-radius: 10px;
+            overflow-x: auto;
+            font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+            font-size: 0.88em;
+            line-height: 1.5;
+        }
+        pre code {
+            background: none;
+            color: inherit;
+            padding: 0;
+            font-size: 1em;
+        }
+        blockquote {
+            border-left: 4px solid #4361ee;
+            margin: 16px 0;
+            padding: 12px 20px;
+            background: #f0f3ff;
+            color: #2d3436;
+        }
+        hr {
+            border: none;
+            border-top: 2px solid #e0e0e0;
+            margin: 36px 0;
+        }
+        a { color: #4361ee; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+        ul, ol { padding-left: 24px; }
+        li { margin: 6px 0; }
+        strong { color: #1a1a2e; }
+        em { color: #636e72; }
+        .meta {
+            color: #636e72;
+            font-size: 0.92em;
+            margin-bottom: 24px;
+        }
+        .toc { background: #f0f3ff; padding: 20px 28px; border-radius: 10px; margin: 24px 0; }
+        .toc ul { list-style: none; padding-left: 0; }
+        .toc li { margin: 6px 0; }
+        .toc a { color: #4361ee; }
+        @media (max-width: 768px) {
+            body { padding: 16px 12px; }
+            .container { padding: 24px 18px; }
+            table { font-size: 0.84em; }
+            th, td { padding: 6px 8px; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+<h1 id="scnet-mcp-server-prd">SCNet MCP Server — 产品需求文档 (PRD)</h1>
+<blockquote>
+<p><strong>版本</strong>: v2.0<br />
+<strong>最后更新</strong>: 2026-07-07<br />
+<strong>项目状态</strong>: 生产运行中 (Production ✅)<br />
+<strong>代码仓库</strong>: <code>/root/private_data/sun/code/api2mcp/</code></p>
+</blockquote>
+<hr />
+<h2 id="_1">目录</h2>
+<ol>
+<li><a href="#1-产品概述">产品概述</a></li>
+<li><a href="#2-目标与范围">目标与范围</a></li>
+<li><a href="#3-系统架构">系统架构</a></li>
+<li><a href="#4-认证体系">认证体系</a></li>
+<li><a href="#5-mcp-工具目录">MCP 工具目录</a></li>
+<li><a href="#6-数据库设计">数据库设计</a></li>
+<li><a href="#7-部署与运维">部署与运维</a></li>
+<li><a href="#8-测试体系">测试体系</a></li>
+<li><a href="#9-限制与边界">限制与边界</a></li>
+<li><a href="#10-风险与应急预案">风险与应急预案</a></li>
+<li><a href="#11-未来规划">未来规划</a></li>
+<li><a href="#12-附录">附录</a></li>
+</ol>
+<hr />
+<h2 id="1">1. 产品概述</h2>
+<h3 id="11">1.1 背景</h3>
+<p>SCNet（超级计算网络）是一个面向科研与工业计算的高性能计算平台，提供 HPC 作业调度、分布式文件存储、容器/Notebook 开发环境等服务。用户通过 SCNet 门户网站或 API 管理计算资源，但缺乏标准化的 AI Agent 协议接入能力。</p>
+<h3 id="12">1.2 产品定位</h3>
+<p>SCNet MCP Server 是一个 <strong>StreamableHTTP 协议</strong> 的 <a href="https://modelcontextprotocol.io">Model Context Protocol (MCP)</a> 服务端实现，它将 SCNet OpenAPI 的 60+ 个 HTTP 端点封装为 AI Agent 可直接调用的 MCP 工具，让大语言模型能够以自然语言驱动的方式操作 SCNet 计算资源。</p>
+<h3 id="13">1.3 核心价值</h3>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>标准化接入</strong></td>
+<td>通过 MCP 协议统一向 AI Agent（Claude、Cursor 等）暴露 SCNet 能力</td>
+</tr>
+<tr>
+<td><strong>零学习成本</strong></td>
+<td>用户无需记住 API 文档，用自然语言描述即可完成复杂操作</td>
+</tr>
+<tr>
+<td><strong>安全可控</strong></td>
+<td>AK/SK 双因子认证 + 24h 自动续约 + 链接级文件下载</td>
+</tr>
+<tr>
+<td><strong>动态可扩展</strong></td>
+<td>工具注册通过 DB 配置驱动，新增 API 无需修改代码</td>
+</tr>
+</tbody>
+</table>
+<h3 id="14">1.4 用户场景</h3>
+<ul>
+<li><strong>科研人员</strong>: "帮我提交一个 16 核 GPU 作业到昆山集群，运行我的 training.py"</li>
+<li><strong>运维人员</strong>: "列出哈尔滨集群上我所有的运行中作业"</li>
+<li><strong>数据分析师</strong>: "把 result.tar.gz 上传到西安集群的 work 目录下"</li>
+<li><strong>开发者</strong>: "在乌镇集群创建一个 Jupyter Notebook，配 4 核 32GB 内存"</li>
+<li><strong>跨集群文件操作</strong>: "将文件从华东一区复制到西北一区"</li>
+</ul>
+<hr />
+<h2 id="2">2. 目标与范围</h2>
+<h3 id="21">2.1 核心目标</h3>
+<ol>
+<li><strong>全功能覆盖</strong>: 完整映射 SCNet 的核心 API（HPC 作业、文件系统、容器、Notebook、用户信息）</li>
+<li><strong>零信任安全</strong>: 每次工具调用都经过 DB 鉴权，令牌过期自动续约，续约失败提示用户重认证</li>
+<li><strong>一致性保证</strong>: 文件操作通过一致性哈希固定后端，消除跨后端 "文件找不到" 问题</li>
+<li><strong>大文件处理</strong>: 提供分片上传、流式下载、直链下载三种方式，突破 MCP SSE 传输限制</li>
+<li><strong>自助认证</strong>: 网页认证页面引导用户完成 AK/SK 输入，认证结果实时反馈</li>
+</ol>
+<h3 id="22">2.2 非目标</h3>
+<ul>
+<li>❌ 不提供 SCNet Web 管理 UI 替代（认证页面仅用于 MCP 凭证输入）</li>
+<li>❌ 不处理用户注册、密钥管理（由 SCNet 门户网站完成）</li>
+<li>❌ 不做实时监控面板（未来可能通过可观测性工具补充）</li>
+</ul>
+<h3 id="23">2.3 约束条件</h3>
+<table>
+<thead>
+<tr>
+<th>约束</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>传输层</strong></td>
+<td>仅支持 <code>streamable-http</code> 传输模式（不支持 stdio）</td>
+</tr>
+<tr>
+<td><strong>部署环境</strong></td>
+<td>运行在线上模型部署容器内，通过 nginx 反向代理对外服务</td>
+</tr>
+<tr>
+<td><strong>单机部署</strong></td>
+<td>SQLite 单节点，不支持多副本水平扩展</td>
+</tr>
+<tr>
+<td><strong>第三方依赖</strong></td>
+<td><code>fastmcp&gt;=3.0</code>、<code>httpx&gt;=0.27</code>、<code>pydantic&gt;=2.0</code></td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="3">3. 系统架构</h2>
+<h3 id="31">3.1 整体架构</h3>
+<div class="codehilite"><pre><span></span><code>                        ┌─────────────────────────────────┐
+                        │         AI Agent (Claude)        │
+                        │  MCP Client (StreamableHTTP)     │
+                        └──────────────┬──────────────────┘
+                                       │
+                              MCP 协议 (HTTP SSE)
+                                       │
+                        ┌──────────────▼──────────────────┐
+                        │     Nginx 反向代理 (443)         │
+                        │  /mcp/{ak} → 127.0.0.1:8002     │
+                        │  /auth/{ak} → 127.0.0.1:8002    │
+                        │  /mcp_test/ → 127.0.0.1:8003    │
+                        └──────────────┬──────────────────┘
+                                       │
+                        ┌──────────────▼──────────────────┐
+                        │     SCNet MCP Server (FastMCP)   │
+                        │     StreamableHTTP Server        │
+                        │     0.0.0.0:8002/8003            │
+                        └──────┬──────┬──────┬──────┬─────┘
+                               │      │      │      │
+                    ┌──────────┘      │      │      └──────────┐
+                    ▼                 ▼      ▼                 ▼
+             ┌───────────┐   ┌──────────┐ ┌──────────┐ ┌───────────┐
+             │ SQLite DB │   │   SCNet  │ │ SCNet    │ │ 集群eFile │
+             │ (apis.db) │   │ Token API│ │ Center   │ │ /HPC/AI  │
+             └───────────┘   └──────────┘ └──────────┘ └───────────┘
+</code></pre></div>
+
+<h3 id="32">3.2 路由设计</h3>
+<table>
+<thead>
+<tr>
+<th>路由</th>
+<th>说明</th>
+<th>处理逻辑</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>GET /mcp/{accessKey}</code></td>
+<td>MCP 协议入口</td>
+<td>StreamableHTTP 会话，用于工具发现与调用</td>
+</tr>
+<tr>
+<td><code>GET /auth/{accessKey}</code></td>
+<td>认证页面</td>
+<td>返回 AK/SK 输入 HTML 表单</td>
+</tr>
+<tr>
+<td><code>POST /auth/{accessKey}</code></td>
+<td>认证提交</td>
+<td>验证 AK/SK，获取并存储集群 tokens</td>
+</tr>
+<tr>
+<td><code>GET /health</code></td>
+<td>健康检查</td>
+<td>返回 <code>{"status": "ok"}</code></td>
+</tr>
+</tbody>
+</table>
+<h3 id="33">3.3 工具分类体系</h3>
+<p>60+ 工具分为 5 个功能域：</p>
+<table>
+<thead>
+<tr>
+<th>域</th>
+<th>数量</th>
+<th>依赖 token 类型</th>
+<th>依赖 URL 类型</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>HPC 作业管理</strong></td>
+<td>11</td>
+<td>clusterToken / acToken</td>
+<td>hpcUrls</td>
+</tr>
+<tr>
+<td><strong>eFile 文件系统</strong></td>
+<td>25</td>
+<td>clusterToken</td>
+<td>efileUrls</td>
+</tr>
+<tr>
+<td><strong>容器管理</strong></td>
+<td>11</td>
+<td>clusterToken</td>
+<td>aiUrls</td>
+</tr>
+<tr>
+<td><strong>Notebook 管理</strong></td>
+<td>12</td>
+<td>clusterToken</td>
+<td>aiUrls</td>
+</tr>
+<tr>
+<td><strong>用户 &amp; 集群</strong></td>
+<td>2</td>
+<td>acToken</td>
+<td>静态 URL</td>
+</tr>
+</tbody>
+</table>
+<h3 id="34-url">3.4 后端 URL 选择策略</h3>
+<p>所有 efile/hpc/ai 工具在调用前需从多个后端 URL 中选择一个。项目早期使用<strong>轮询 (round-robin)</strong> 方式，但导致跨后端文件操作的严重不一致（如 <code>efile_touch</code> 创建文件到后端 A，<code>efile_move</code> 从后端 B 查找不到文件）。</p>
+<p><strong>解决方案</strong>: 一致性哈希 (<code>_pick_url</code>)</p>
+<div class="codehilite"><pre><span></span><code><span class="k">def</span> <span class="nf">_pick_url</span><span class="p">(</span><span class="n">valid_urls</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span> <span class="n">hash_key</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Pick a URL via consistent hashing of *hash_key*.&quot;&quot;&quot;</span>
+    <span class="n">n</span> <span class="o">=</span> <span class="nb">len</span><span class="p">(</span><span class="n">valid_urls</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">n</span> <span class="o">==</span> <span class="mi">1</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">valid_urls</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="mi">0</span>
+    <span class="n">idx</span> <span class="o">=</span> <span class="nb">abs</span><span class="p">(</span><span class="nb">hash</span><span class="p">(</span><span class="n">hash_key</span><span class="p">))</span> <span class="o">%</span> <span class="n">n</span>
+    <span class="k">return</span> <span class="n">valid_urls</span><span class="p">[</span><span class="n">idx</span><span class="p">],</span> <span class="n">idx</span>
+</code></pre></div>
+
+<ul>
+<li><code>hash_key</code> 一般为文件路径或集群 ID</li>
+<li>同一路径始终命中同一后端，消除不一致性</li>
+<li>已在全部 57 处调用点替换 round-robin</li>
+</ul>
+<hr />
+<h2 id="4">4. 认证体系</h2>
+<h3 id="41">4.1 认证流程</h3>
+<div class="codehilite"><pre><span></span><code>┌─────────────────────────────────────────────────────────────────┐
+│  1. Agent 连接 /mcp/{accessKey}                                  │
+│  2. 服务端检查 users 表 → acToken 是否存在                        │
+│  3. 不存在 → 返回 auth_url → Agent 提示用户打开浏览器             │
+│  4. 用户访问 /auth/{accessKey}                                    │
+│  5. 输入 SCNet userName + Secret Key (SK)                         │
+│  6. 服务端调用 SCNet Token API 验证 AK/SK/userName 三元组         │
+│  7. 验证通过 → 存储 users.acToken + user_cluster.* tokens         │
+│  8. 调用 get-center-info 获取各集群的 hpcUrls/efileUrls/aiUrls    │
+│  9. 存储 cluster_url 表 → 认证完成                                │
+└─────────────────────────────────────────────────────────────────┘
+</code></pre></div>
+
+<h3 id="42">4.2 令牌生命周期</h3>
+<table>
+<thead>
+<tr>
+<th>令牌</th>
+<th>存储位置</th>
+<th>有效期</th>
+<th>续约策略</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>acToken</code></td>
+<td><code>users.acToken</code></td>
+<td>24 小时</td>
+<td>自动续约 (<code>_renew_and_persist_token</code>)</td>
+</tr>
+<tr>
+<td><code>clusterToken</code></td>
+<td><code>user_cluster.token</code></td>
+<td>24 小时</td>
+<td>自动续约，按集群独立加锁</td>
+</tr>
+<tr>
+<td>SK (Secret Key)</td>
+<td>不留存</td>
+<td>—</td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<h3 id="43">4.3 自动续约机制</h3>
+<p>每次工具调用发现 SCNet API 返回 <code>code=10008</code>（令牌过期）时，自动触发续约：</p>
+<ol>
+<li><strong>并发防护</strong>: 每个用户一个 <code>asyncio.Lock</code>，防止并发续约</li>
+<li><strong>双重检查</strong>: 获取锁后再次检查 DB 中的 token 是否已被其他协程更新</li>
+<li><strong>调用续约 API</strong>: <code>POST /ac/openapi/v2/tokens/next</code></li>
+<li><strong>持久化</strong>: 续约成功后立即更新 DB</li>
+<li><strong>重试</strong>: 使用新 token 重试原始请求</li>
+</ol>
+<p>若续约失败（如超过 24h 不再支持续约），返回 <code>auth_url</code> 引导用户重新认证。</p>
+<h3 id="44">4.4 安全设计</h3>
+<ul>
+<li><strong>AK (accessKey) 作为会话标识</strong>: 路径参数中的 accessKey 标识用户身份</li>
+<li><strong>无 SK 留存</strong>: Secret Key 仅用于初始认证，验证通过后丢弃</li>
+<li><strong>响应注入 auth_url</strong>: 所有工具返回 token 过期错误时自动附加 <code>auth_url</code> 字段</li>
+<li><strong>下载链接含 token</strong>: <code>efile_download</code> 和 <code>efile_get_download_link</code> 返回的 URL 直接携带认证 token</li>
+<li><strong>参数校验</strong>: 14 个关键工具使用 <code>_require_params</code> 手动校验缺参情况</li>
+</ul>
+<hr />
+<h2 id="5-mcp">5. MCP 工具目录</h2>
+<h3 id="51-hpc-11">5.1 HPC 作业管理 (11 工具)</h3>
+<table>
+<thead>
+<tr>
+<th>工具名</th>
+<th>描述</th>
+<th>底层 API</th>
+<th>Token</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>hpc_list_available_partitions</code></td>
+<td>列出所有集群可用队列分区</td>
+<td>聚合多集群 API</td>
+<td>clusterToken</td>
+</tr>
+<tr>
+<td><code>hpc_submit_job</code></td>
+<td>提交 HPC 批处理作业</td>
+<td><code>hpc/openapi/v2/job/submit</code></td>
+<td>clusterToken</td>
+</tr>
+<tr>
+<td><code>hpc_cancel_job</code></td>
+<td>取消指定作业</td>
+<td><code>hpc/openapi/v2/job/action</code></td>
+<td>clusterToken</td>
+</tr>
+<tr>
+<td><code>hpc_query_job_state</code></td>
+<td>查询作业当前状态</td>
+<td><code>hpc/openapi/v2/job/state</code></td>
+<td>clusterToken</td>
+</tr>
+<tr>
+<td><code>hpc_query_queue_jobs</code></td>
+<td>查询队列中的作业列表</td>
+<td><code>hpc/openapi/v2/job/queue</code></td>
+<td>clusterToken</td>
+</tr>
+<tr>
+<td><code>hpc_query_core_num</code></td>
+<td>查询集群核心/节点数量</td>
+<td><code>hpc/openapi/v2/job/core</code></td>
+<td>clusterToken</td>
+</tr>
+<tr>
+<td><code>hpc_query_user_quota</code></td>
+<td>查询用户配额（核时/存储）</td>
+<td><code>hpc/openapi/v2/job/quota</code></td>
+<td>clusterToken</td>
+</tr>
+<tr>
+<td><code>hpc_query_used_time</code></td>
+<td>查询用户已使用时间</td>
+<td><code>hpc/openapi/v2/job/usedtime</code></td>
+<td>clusterToken</td>
+</tr>
+<tr>
+<td><code>hpc_list_history_jobs</code></td>
+<td>列出历史作业（跨所有集群）</td>
+<td><code>ac/openapi/v2/history</code></td>
+<td>acToken</td>
+</tr>
+<tr>
+<td><code>hpc_list_running_jobs</code></td>
+<td>列出运行中作业（跨所有集群）</td>
+<td><code>ac/openapi/v2/realtime</code></td>
+<td>acToken</td>
+</tr>
+<tr>
+<td><code>hpc_get_running_job_detail</code></td>
+<td>获取运行中作业详情</td>
+<td><code>hpc/openapi/v2/job/detail</code></td>
+<td>clusterToken</td>
+</tr>
+<tr>
+<td><code>hpc_get_history_job_detail</code></td>
+<td>获取已结束作业详情</td>
+<td><code>hpc/openapi/v2/job/detail</code></td>
+<td>clusterToken</td>
+</tr>
+</tbody>
+</table>
+<p><strong>关键特性</strong>:
+- <code>hpc_list_history_jobs</code> 和 <code>hpc_list_running_jobs</code> 使用 acToken（平台级 token），可跨集群聚合查询
+- 其余工具使用 clusterToken（集群级 token），仅操作指定集群
+- <code>hpc_submit_job</code> 支持 <code>job_name</code> 自动生成、<code>strJobInfoMap</code> JSON 解析、多节点多核心配置</p>
+<h3 id="52-efile-25">5.2 eFile 文件系统 (25 工具)</h3>
+<h4 id="521-7">5.2.1 基础文件操作 (7 工具)</h4>
+<table>
+<thead>
+<tr>
+<th>工具名</th>
+<th>描述</th>
+<th>底层 API</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>efile_list_files</code></td>
+<td>列出目录下的文件</td>
+<td><code>GET /efile/openapi/v2/file/list</code></td>
+</tr>
+<tr>
+<td><code>efile_touch</code></td>
+<td>创建空文件或更新修改时间</td>
+<td><code>POST /efile/openapi/v2/file/touch</code></td>
+</tr>
+<tr>
+<td><code>efile_exist</code></td>
+<td>检查文件/目录是否存在</td>
+<td><code>POST /efile/openapi/v2/file/exist</code></td>
+</tr>
+<tr>
+<td><code>efile_rename</code></td>
+<td>重命名文件或目录</td>
+<td><code>POST /efile/openapi/v2/file/rename</code></td>
+</tr>
+<tr>
+<td><code>efile_move</code></td>
+<td>移动文件/文件夹到目标路径</td>
+<td><code>POST /efile/openapi/v2/file/move</code></td>
+</tr>
+<tr>
+<td><code>efile_copy</code></td>
+<td>复制文件/文件夹到目标路径</td>
+<td><code>POST /efile/openapi/v2/file/copy</code></td>
+</tr>
+<tr>
+<td><code>efile_delete</code></td>
+<td>删除文件或空目录</td>
+<td><code>POST /efile/openapi/v2/file/remove</code></td>
+</tr>
+</tbody>
+</table>
+<h4 id="522-1">5.2.2 目录操作 (1 工具)</h4>
+<table>
+<thead>
+<tr>
+<th>工具名</th>
+<th>描述</th>
+<th>底层 API</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>efile_folder_create</code></td>
+<td>创建文件夹（递归创建）</td>
+<td><code>POST /efile/openapi/v2/file/mkdir</code></td>
+</tr>
+</tbody>
+</table>
+<h4 id="523-5">5.2.3 文件上传 (5 工具)</h4>
+<table>
+<thead>
+<tr>
+<th>工具名</th>
+<th>描述</th>
+<th>底层 API</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>efile_upload</code></td>
+<td>单次上传小文件（≤100MB）</td>
+<td><code>POST /efile/openapi/v2/file/upload</code></td>
+</tr>
+<tr>
+<td><code>efile_get_upload_config</code></td>
+<td>根据文件大小推荐上传策略</td>
+<td>—（纯计算）</td>
+</tr>
+<tr>
+<td><code>efile_chunk_upload</code></td>
+<td>分片上传（每片 50MB，安全 ≤75MB）</td>
+<td><code>POST /efile/openapi/v2/file/burst</code></td>
+</tr>
+<tr>
+<td><code>efile_batch_chunk_upload</code></td>
+<td>批量并行上传（最多10片/次，每片安全 ≤8MB）</td>
+<td><code>POST /efile/openapi/v2/file/burst</code></td>
+</tr>
+<tr>
+<td><code>efile_merge_file</code></td>
+<td>合并分片上传的文件</td>
+<td><code>POST /efile/openapi/v2/file/merge</code></td>
+</tr>
+</tbody>
+</table>
+<p><strong>上传策略矩阵</strong>:</p>
+<div class="codehilite"><pre><span></span><code><span class="err">文件大小</span><span class="w">          </span><span class="o">|</span><span class="w"> </span><span class="err">推荐工具</span><span class="w">                    </span><span class="o">|</span><span class="w"> </span><span class="err">限制</span>
+<span class="err">──────────────────┼─────────────────────────────┼──────────────────────</span>
+<span class="err">≤</span><span class="w"> </span><span class="mi">100</span><span class="w"> </span><span class="n">MB</span><span class="w">          </span><span class="o">|</span><span class="w"> </span><span class="n">efile_upload</span><span class="w"> </span><span class="p">(</span><span class="err">单次上传</span><span class="p">)</span><span class="w">     </span><span class="o">|</span><span class="w"> </span><span class="n">base64</span><span class="w"> </span><span class="err">编码后一次传输</span>
+<span class="mi">100</span><span class="w"> </span><span class="n">MB</span><span class="w"> </span><span class="err">–</span><span class="w"> </span><span class="mi">5</span><span class="w"> </span><span class="n">GB</span><span class="w">     </span><span class="o">|</span><span class="w"> </span><span class="n">efile_chunk_upload</span><span class="w">          </span><span class="o">|</span><span class="w"> </span><span class="err">每片</span><span class="w"> </span><span class="err">≤</span><span class="mi">75</span><span class="w"> </span><span class="n">MB</span><span class="w"> </span><span class="p">(</span><span class="err">安全值</span><span class="p">)</span>
+<span class="mi">100</span><span class="w"> </span><span class="n">MB</span><span class="w"> </span><span class="err">–</span><span class="w"> </span><span class="mi">5</span><span class="w"> </span><span class="n">GB</span><span class="w">     </span><span class="o">|</span><span class="w"> </span><span class="n">efile_batch_chunk_upload</span><span class="w">    </span><span class="o">|</span><span class="w"> </span><span class="err">每片</span><span class="w"> </span><span class="err">≤</span><span class="mi">8</span><span class="w"> </span><span class="n">MB</span><span class="err">，每批</span><span class="w"> </span><span class="err">≤</span><span class="mi">80</span><span class="w"> </span><span class="n">MB</span>
+<span class="o">&gt;</span><span class="w"> </span><span class="mi">5</span><span class="w"> </span><span class="n">GB</span><span class="w">            </span><span class="o">|</span><span class="w"> </span><span class="err">拒绝，建议</span><span class="w"> </span><span class="n">SCP</span><span class="o">/</span><span class="n">SFTP</span><span class="w">         </span><span class="o">|</span><span class="w"> </span><span class="err">硬限制</span>
+</code></pre></div>
+
+<h4 id="524-4">5.2.4 文件下载 (4 工具)</h4>
+<table>
+<thead>
+<tr>
+<th>工具名</th>
+<th>描述</th>
+<th>实现方式</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>efile_download</code></td>
+<td>返回含 token 的 HTTP 下载链接</td>
+<td>HEAD 预检 → 返回 <code>download_url</code></td>
+</tr>
+<tr>
+<td><code>efile_download_chunk</code></td>
+<td>分块下载，返回 base64 分片</td>
+<td>支持 Range 请求，每块 5MB</td>
+</tr>
+<tr>
+<td><code>efile_get_download_link</code></td>
+<td>生成带自定义有效期的下载链接</td>
+<td>直接 URL 拼接，<code>expires_in</code> 参数</td>
+</tr>
+</tbody>
+</table>
+<p><strong>下载策略</strong>:
+- 所有文件统一返回 <code>download_url</code>（后端不返回 Content-Length，无法内联）
+- 小文件（≤200KB）在旧版本中内联返回，现已统一改为链接模式
+- <code>efile_download_chunk</code> 支持分块下载，突破 SSE 传输限制</p>
+<h4 id="525-2">5.2.5 文件分享 (2 工具)</h4>
+<table>
+<thead>
+<tr>
+<th>工具名</th>
+<th>描述</th>
+<th>底层 API</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>efile_open_share</code></td>
+<td>开启文件分享</td>
+<td><code>POST /efile/openapi/v2/file/open-share</code></td>
+</tr>
+<tr>
+<td><code>efile_close_share</code></td>
+<td>关闭文件分享</td>
+<td><code>POST /efile/openapi/v2/file/close-share</code></td>
+</tr>
+</tbody>
+</table>
+<h4 id="526-4">5.2.6 其他操作 (4 工具)</h4>
+<table>
+<thead>
+<tr>
+<th>工具名</th>
+<th>描述</th>
+<th>底层 API</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>efile_check_permission</code></td>
+<td>检查是否有指定权限</td>
+<td><code>POST /efile/openapi/v2/file/permission</code></td>
+</tr>
+<tr>
+<td><code>efile_preview_file</code></td>
+<td>预览文件内容（文本/图片）</td>
+<td><code>POST /efile/openapi/v2/file/preview</code></td>
+</tr>
+<tr>
+<td><code>efile_get_upload_config</code></td>
+<td>获取上传配置推荐</td>
+<td>—（纯计算函数）</td>
+</tr>
+<tr>
+<td><code>efile_get_download_link</code></td>
+<td>生成下载链接</td>
+<td>—（URL 拼接）</td>
+</tr>
+</tbody>
+</table>
+<h4 id="527-5">5.2.7 异步操作 (5 工具)</h4>
+<table>
+<thead>
+<tr>
+<th>工具名</th>
+<th>描述</th>
+<th>底层 API</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>efile_async_copy</code></td>
+<td>异步复制大文件/目录</td>
+<td><code>POST /efile/openapi/v2/file/async-copy</code></td>
+</tr>
+<tr>
+<td><code>efile_async_move</code></td>
+<td>异步移动大文件/目录</td>
+<td><code>POST /efile/openapi/v2/file/async-move</code></td>
+</tr>
+<tr>
+<td><code>efile_async_delete</code></td>
+<td>异步删除大文件/目录</td>
+<td><code>POST /efile/openapi/v2/file/async-remove</code></td>
+</tr>
+<tr>
+<td><code>efile_async_task_cancel</code></td>
+<td>取消异步任务</td>
+<td><code>POST /efile/openapi/v2/file/task/cancel</code></td>
+</tr>
+<tr>
+<td><code>efile_async_task_list</code></td>
+<td>列出异步任务列表</td>
+<td><code>POST /efile/openapi/v2/file/task/list</code></td>
+</tr>
+</tbody>
+</table>
+<h3 id="53-11">5.3 容器管理 (11 工具)</h3>
+<table>
+<thead>
+<tr>
+<th>工具名</th>
+<th>描述</th>
+<th>底层 API</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>container_create</code></td>
+<td>创建容器实例</td>
+<td><code>ai/openapi/v2/container/create</code></td>
+</tr>
+<tr>
+<td><code>container_start</code></td>
+<td>启动容器</td>
+<td><code>ai/openapi/v2/container/start</code></td>
+</tr>
+<tr>
+<td><code>container_stop</code></td>
+<td>停止容器</td>
+<td><code>ai/openapi/v2/container/stop</code></td>
+</tr>
+<tr>
+<td><code>container_delete</code></td>
+<td>删除容器</td>
+<td><code>ai/openapi/v2/container/delete</code></td>
+</tr>
+<tr>
+<td><code>container_execute</code></td>
+<td>在容器中执行命令</td>
+<td><code>ai/openapi/v2/container/execute</code></td>
+</tr>
+<tr>
+<td><code>container_query_list</code></td>
+<td>查询容器列表</td>
+<td><code>ai/openapi/v2/container/list</code></td>
+</tr>
+<tr>
+<td><code>container_query_url</code></td>
+<td>查询容器访问 URL</td>
+<td><code>ai/openapi/v2/container/url</code></td>
+</tr>
+<tr>
+<td><code>container_query_detail</code></td>
+<td>查询容器详情</td>
+<td><code>ai/openapi/v2/container/detail</code></td>
+</tr>
+<tr>
+<td><code>container_update_resource</code></td>
+<td>更新容器资源配置</td>
+<td><code>ai/openapi/v2/container/resize</code></td>
+</tr>
+<tr>
+<td><code>container_query_resources</code></td>
+<td>查询集群可分配资源</td>
+<td><code>ai/openapi/v2/container/resource</code></td>
+</tr>
+<tr>
+<td><code>container_query_resource_group</code></td>
+<td>查询资源分组</td>
+<td><code>ai/openapi/v2/container/group</code></td>
+</tr>
+<tr>
+<td><code>container_query_allowed_mount_dir</code></td>
+<td>查询允许挂载的目录</td>
+<td><code>ai/openapi/v2/container/mount</code></td>
+</tr>
+<tr>
+<td><code>container_get_images</code></td>
+<td>查询可用镜像列表</td>
+<td><code>ai/openapi/v2/container/image</code></td>
+</tr>
+</tbody>
+</table>
+<p><strong>容器类型支持</strong>: SSH / Jupyter / CodeServer / RStudio</p>
+<h3 id="54-notebook-12">5.4 Notebook 管理 (12 工具)</h3>
+<table>
+<thead>
+<tr>
+<th>工具名</th>
+<th>描述</th>
+<th>底层 API</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>notebook_list_resources</code></td>
+<td>列出可用的 Notebook 资源</td>
+<td><code>ai/openapi/v2/jupyter/resource</code></td>
+</tr>
+<tr>
+<td><code>notebook_create</code></td>
+<td>创建 Notebook 实例</td>
+<td><code>ai/openapi/v2/jupyter/create</code></td>
+</tr>
+<tr>
+<td><code>notebook_start</code></td>
+<td>启动 Notebook</td>
+<td><code>ai/openapi/v2/jupyter/start</code></td>
+</tr>
+<tr>
+<td><code>notebook_list</code></td>
+<td>列出用户 Notebook 列表</td>
+<td><code>ai/openapi/v2/jupyter/list</code></td>
+</tr>
+<tr>
+<td><code>notebook_detail</code></td>
+<td>查询 Notebook 详情</td>
+<td><code>ai/openapi/v2/jupyter/detail</code></td>
+</tr>
+<tr>
+<td><code>notebook_stop</code></td>
+<td>停止 Notebook</td>
+<td><code>ai/openapi/v2/jupyter/stop</code></td>
+</tr>
+<tr>
+<td><code>notebook_release</code></td>
+<td>释放 Notebook 资源</td>
+<td><code>ai/openapi/v2/jupyter/release</code></td>
+</tr>
+<tr>
+<td><code>notebook_rename</code></td>
+<td>重命名 Notebook</td>
+<td><code>ai/openapi/v2/jupyter/rename</code></td>
+</tr>
+<tr>
+<td><code>notebook_list_images</code></td>
+<td>列出可用镜像（支持筛选）</td>
+<td><code>ai/openapi/v2/jupyter/images</code></td>
+</tr>
+<tr>
+<td><code>notebook_list_model_images</code></td>
+<td>列出模型镜像</td>
+<td><code>ai/openapi/v2/jupyter/images</code></td>
+</tr>
+<tr>
+<td><code>notebook_query_jupyter_url</code></td>
+<td>获取 Jupyter 访问 URL</td>
+<td><code>ai/openapi/v2/jupyter/url</code></td>
+</tr>
+<tr>
+<td><code>notebook_query_custom_service_url</code></td>
+<td>获取自定义服务 URL</td>
+<td><code>ai/openapi/v2/jupyter/url</code></td>
+</tr>
+<tr>
+<td><code>notebook_start_custom_service</code></td>
+<td>启动自定义服务</td>
+<td><code>ai/openapi/v2/jupyter/custom-service</code></td>
+</tr>
+</tbody>
+</table>
+<h3 id="55-2">5.5 用户与集群 (2 工具)</h3>
+<table>
+<thead>
+<tr>
+<th>工具名</th>
+<th>描述</th>
+<th>底层 API</th>
+<th>Token</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>get_user_info</code></td>
+<td>获取当前用户账号信息</td>
+<td><code>ac/openapi/v2/user</code></td>
+<td>acToken</td>
+</tr>
+<tr>
+<td><code>set_default_cluster</code></td>
+<td>设置默认集群</td>
+<td>—（DB 操作）</td>
+<td>—</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="6">6. 数据库设计</h2>
+<h3 id="61">6.1 实体关系</h3>
+<div class="codehilite"><pre><span></span><code>users 1────────────N user_cluster N────────────1 cluster_url
+  │                      │
+  │                      └── token (clusterToken)
+  └── acToken (platform token)
+
+APIs: 工具注册表（动态代理工具存储于此）
+</code></pre></div>
+
+<h3 id="62">6.2 表结构</h3>
+<h4 id="apis"><code>APIs</code> — 动态工具注册表</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">CREATE</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="k">IF</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">EXISTS</span><span class="w"> </span><span class="n">APIs</span><span class="w"> </span><span class="p">(</span>
+<span class="w">    </span><span class="n">name</span><span class="w">     </span><span class="nb">TEXT</span><span class="w"> </span><span class="k">PRIMARY</span><span class="w"> </span><span class="k">KEY</span><span class="p">,</span><span class="w">   </span><span class="c1">-- MCP 工具名</span>
+<span class="w">    </span><span class="n">document</span><span class="w"> </span><span class="nb">TEXT</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">NULL</span><span class="w">       </span><span class="c1">-- JSON 文档（URL、方法、参数、返回 schema）</span>
+<span class="p">);</span>
+</code></pre></div>
+
+<p><strong>document JSON 结构</strong>:</p>
+<div class="codehilite"><pre><span></span><code><span class="p">{</span>
+<span class="w">  </span><span class="nt">&quot;url&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;{efileUrls}/efile/openapi/v2/file/list&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;method&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;GET&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;description&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;列出目录下的文件&quot;</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">&quot;parameters&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;format&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;URLParameter&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;schema&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">      </span><span class="nt">&quot;path&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;string&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;description&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;目录绝对路径&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;optional&quot;</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">}</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">  </span><span class="p">},</span>
+<span class="w">  </span><span class="nt">&quot;returns&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="nt">&quot;format&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;JSON&quot;</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">&quot;schema&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;code&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;string&quot;</span><span class="p">}</span><span class="w"> </span><span class="p">}</span>
+<span class="w">  </span><span class="p">}</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<h4 id="users"><code>users</code> — 用户认证表</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">CREATE</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="k">IF</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">EXISTS</span><span class="w"> </span><span class="n">users</span><span class="w"> </span><span class="p">(</span>
+<span class="w">    </span><span class="n">userName</span><span class="w">   </span><span class="nb">TEXT</span><span class="w"> </span><span class="k">PRIMARY</span><span class="w"> </span><span class="k">KEY</span><span class="p">,</span>
+<span class="w">    </span><span class="n">accessKey</span><span class="w">  </span><span class="nb">TEXT</span><span class="w"> </span><span class="k">UNIQUE</span><span class="p">,</span><span class="w">      </span><span class="c1">-- 访问密钥（会话标识）</span>
+<span class="w">    </span><span class="n">acToken</span><span class="w">    </span><span class="nb">TEXT</span><span class="p">,</span><span class="w">             </span><span class="c1">-- 平台令牌（NULL 表示未认证）</span>
+<span class="w">    </span><span class="n">created_at</span><span class="w"> </span><span class="n">datetime</span><span class="p">,</span>
+<span class="w">    </span><span class="n">updated_at</span><span class="w"> </span><span class="n">datetime</span>
+<span class="p">);</span>
+</code></pre></div>
+
+<h4 id="user_cluster"><code>user_cluster</code> — 用户集群配置</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">CREATE</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="k">IF</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">EXISTS</span><span class="w"> </span><span class="n">user_cluster</span><span class="w"> </span><span class="p">(</span>
+<span class="w">    </span><span class="n">userName</span><span class="w">        </span><span class="nb">TEXT</span><span class="p">,</span>
+<span class="w">    </span><span class="n">clusterId</span><span class="w">       </span><span class="nb">INTEGER</span><span class="p">,</span>
+<span class="w">    </span><span class="n">clusterName</span><span class="w">     </span><span class="nb">TEXT</span><span class="p">,</span>
+<span class="w">    </span><span class="n">homePath</span><span class="w">        </span><span class="nb">TEXT</span><span class="p">,</span><span class="w">           </span><span class="c1">-- 用户 home 目录</span>
+<span class="w">    </span><span class="n">token</span><span class="w">           </span><span class="nb">TEXT</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">NULL</span><span class="p">,</span><span class="w">  </span><span class="c1">-- 集群级令牌</span>
+<span class="w">    </span><span class="n">isDefault</span><span class="w">       </span><span class="nb">boolean</span><span class="p">,</span><span class="w">        </span><span class="c1">-- 是否为默认集群</span>
+<span class="w">    </span><span class="n">JobManagerType</span><span class="w">  </span><span class="nb">TEXT</span><span class="p">,</span><span class="w">           </span><span class="c1">-- 调度器类型 (SLURM)</span>
+<span class="w">    </span><span class="n">JobManagerAddr</span><span class="w">  </span><span class="nb">TEXT</span><span class="p">,</span><span class="w">           </span><span class="c1">-- 调度器地址</span>
+<span class="w">    </span><span class="n">JobManagerid</span><span class="w">    </span><span class="nb">TEXT</span><span class="p">,</span>
+<span class="w">    </span><span class="n">JobManagertext</span><span class="w">  </span><span class="nb">TEXT</span><span class="p">,</span>
+<span class="w">    </span><span class="n">JobManagerPort</span><span class="w">  </span><span class="nb">TEXT</span><span class="p">,</span>
+<span class="w">    </span><span class="n">created_at</span><span class="w">      </span><span class="n">datetime</span><span class="p">,</span>
+<span class="w">    </span><span class="n">updated_at</span><span class="w">      </span><span class="n">datetime</span><span class="p">,</span>
+<span class="w">    </span><span class="k">PRIMARY</span><span class="w"> </span><span class="k">KEY</span><span class="w"> </span><span class="p">(</span><span class="n">userName</span><span class="p">,</span><span class="w"> </span><span class="n">clusterId</span><span class="p">)</span>
+<span class="p">);</span>
+</code></pre></div>
+
+<h4 id="cluster_url-url"><code>cluster_url</code> — 集群服务 URL</h4>
+<div class="codehilite"><pre><span></span><code><span class="k">CREATE</span><span class="w"> </span><span class="k">TABLE</span><span class="w"> </span><span class="k">IF</span><span class="w"> </span><span class="k">NOT</span><span class="w"> </span><span class="k">EXISTS</span><span class="w"> </span><span class="n">cluster_url</span><span class="w"> </span><span class="p">(</span>
+<span class="w">    </span><span class="n">clusterId</span><span class="w">   </span><span class="nb">INTEGER</span><span class="w"> </span><span class="k">PRIMARY</span><span class="w"> </span><span class="k">KEY</span><span class="p">,</span>
+<span class="w">    </span><span class="n">clusterName</span><span class="w"> </span><span class="nb">TEXT</span><span class="p">,</span>
+<span class="w">    </span><span class="n">hpcUrls</span><span class="w">     </span><span class="nb">TEXT</span><span class="p">,</span><span class="w">      </span><span class="c1">-- 逗号分隔的 HPC API URLs</span>
+<span class="w">    </span><span class="n">aiUrls</span><span class="w">      </span><span class="nb">TEXT</span><span class="p">,</span><span class="w">      </span><span class="c1">-- 逗号分隔的 AI/容器 API URLs</span>
+<span class="w">    </span><span class="n">efileUrls</span><span class="w">   </span><span class="nb">TEXT</span><span class="p">,</span><span class="w">      </span><span class="c1">-- 逗号分隔的文件系统 API URLs</span>
+<span class="w">    </span><span class="n">eshellUrls</span><span class="w">  </span><span class="nb">TEXT</span><span class="w">       </span><span class="c1">-- 逗号分隔的 Shell API URLs</span>
+<span class="p">);</span>
+</code></pre></div>
+
+<hr />
+<h2 id="7">7. 部署与运维</h2>
+<h3 id="71">7.1 环境要求</h3>
+<table>
+<thead>
+<tr>
+<th>组件</th>
+<th>要求</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Python</td>
+<td>3.11+</td>
+</tr>
+<tr>
+<td>依赖</td>
+<td><code>fastmcp&gt;=3.0</code> <code>httpx&gt;=0.27</code> <code>pydantic&gt;=2.0</code></td>
+</tr>
+<tr>
+<td>存储</td>
+<td>SQLite 文件（<code>apis.db</code>）</td>
+</tr>
+<tr>
+<td>网络</td>
+<td>可访问 SCNet API 端点 + nginx 代理</td>
+</tr>
+</tbody>
+</table>
+<h3 id="72">7.2 部署架构</h3>
+<div class="codehilite"><pre><span></span><code>Internet → nginx (443 SSL) → localhost:8002 (MCP Server)
+                          → localhost:8003 (MCP Test Server)
+</code></pre></div>
+
+<h4 id="nginx">nginx 配置要点</h4>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 生产环境 (scnet.cn)</span>
+<span class="k">location</span><span class="w"> </span><span class="s">/mcp/</span><span class="w">    </span><span class="p">{</span><span class="w"> </span><span class="kn">proxy_pass</span><span class="w"> </span><span class="s">http://127.0.0.1:8002</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+<span class="k">location</span><span class="w"> </span><span class="s">/auth/</span><span class="w">   </span><span class="p">{</span><span class="w"> </span><span class="kn">proxy_pass</span><span class="w"> </span><span class="s">http://127.0.0.1:8002</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+
+<span class="c1"># 测试环境 (itos2.sugon.com)</span>
+<span class="k">location</span><span class="w"> </span><span class="s">/mcp_test/</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="kn">proxy_pass</span><span class="w"> </span><span class="s">http://127.0.0.1:8003</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+<span class="k">location</span><span class="w"> </span><span class="s">/auth_test/</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="kn">proxy_pass</span><span class="w"> </span><span class="s">http://127.0.0.1:8003</span><span class="p">;</span><span class="w"> </span><span class="p">}</span>
+</code></pre></div>
+
+<p><strong>环境变量</strong>:</p>
+<table>
+<thead>
+<tr>
+<th>变量</th>
+<th>生产环境</th>
+<th>测试环境</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>SCNET_TOKEN_URL</code></td>
+<td><code>https://api.scnet.cn/...</code></td>
+<td><code>https://itos2.sugon.com/...</code></td>
+</tr>
+<tr>
+<td><code>MCP_AUTH_PREFIX</code></td>
+<td><code>auth</code></td>
+<td><code>auth_test</code></td>
+</tr>
+<tr>
+<td><code>MCP_PORT</code></td>
+<td><code>8002</code></td>
+<td><code>8003</code></td>
+</tr>
+</tbody>
+</table>
+<h3 id="73">7.3 启动方式</h3>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 生产环境</span>
+bash<span class="w"> </span>restartMcp_fixed.sh<span class="w"> </span>prod<span class="w">   </span><span class="c1"># 端口 8002</span>
+
+<span class="c1"># 测试环境</span>
+bash<span class="w"> </span>restartMcp_fixed.sh<span class="w"> </span><span class="nb">test</span><span class="w">   </span><span class="c1"># 端口 8003</span>
+
+<span class="c1"># 监控自动重启</span>
+nohup<span class="w"> </span>python<span class="w"> </span>auto_commit_restart.py<span class="w"> </span>&gt;<span class="w"> </span>/tmp/api2mcp/auto_commit.log<span class="w"> </span><span class="m">2</span>&gt;<span class="p">&amp;</span><span class="m">1</span><span class="w"> </span><span class="p">&amp;</span>
+</code></pre></div>
+
+<h3 id="74">7.4 健康检查</h3>
+<div class="codehilite"><pre><span></span><code>GET /health → {&quot;status&quot;: &quot;ok&quot;}
+</code></pre></div>
+
+<hr />
+<h2 id="8">8. 测试体系</h2>
+<h3 id="81">8.1 测试结构</h3>
+<div class="codehilite"><pre><span></span><code>test/
+├── conftest.py          # 共享 fixtures（mock DB、mock HTTP、auth context）
+├── test_efile.py        # efile 文件系统工具测试（25 个工具全覆盖）
+├── test_container.py    # 容器管理工具测试
+├── test_notebook.py     # Notebook 管理工具测试
+├── test_hpc.py          # HPC 作业管理工具测试
+├── test_integration.py  # 端到端集成测试（依赖真实的 SCNet API）
+</code></pre></div>
+
+<h3 id="82">8.2 测试框架</h3>
+<ul>
+<li><strong>框架</strong>: pytest + pytest-asyncio</li>
+<li><strong>DB 隔离</strong>: 每个测试使用 <code>tempfile.mkstemp()</code> 创建临时 SQLite 数据库</li>
+<li><strong>HTTP Mock</strong>: <code>unittest.mock.AsyncMock</code> 模拟 <code>httpx.AsyncClient</code></li>
+<li><strong>Auth Mock</strong>: 通过 <code>fastmcp.server.http._current_http_request</code> ContextVar 注入 mock 请求</li>
+</ul>
+<h3 id="83">8.3 测试覆盖率目标</h3>
+<ul>
+<li>efile 系列: 25 个工具全覆盖（含缺参校验、权限校验、一致性哈希验证）</li>
+<li>所有 error 分支: HTTP 异常、JSON 解析异常、base64 解码异常</li>
+</ul>
+<h3 id="84-2026-07-07">8.4 已知问题 (2026-07-07)</h3>
+<table>
+<thead>
+<tr>
+<th>问题</th>
+<th>状态</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>efile_download HEAD 无 Content-Length</td>
+<td>⚠️ 已知</td>
+<td>后端 efile API 的 HEAD 请求不返回 <code>content-length</code>，所有文件返回 <code>file_size=0</code> 的下载链接</td>
+</tr>
+<tr>
+<td>efile_download_chunk key 命名</td>
+<td>⚠️ 无关</td>
+<td>测试断言使用 <code>data</code> 但实际返回 <code>file_content_b64</code>，不影响功能</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="9">9. 限制与边界</h2>
+<h3 id="91">9.1 文件传输限制</h3>
+<table>
+<thead>
+<tr>
+<th>操作</th>
+<th>上限</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>单次上传 (efile_upload)</td>
+<td>100 MB</td>
+<td>超过需分片上传</td>
+</tr>
+<tr>
+<td>分片上传单分片</td>
+<td>≤79 MB (建议安全 ≤75 MB)</td>
+<td>实测上限</td>
+</tr>
+<tr>
+<td>批量上传每片</td>
+<td>≤10 MB (建议安全 ≤8 MB)</td>
+<td>实测上限</td>
+</tr>
+<tr>
+<td>批量上传每批总大小</td>
+<td>≤100 MB (建议安全 ≤80 MB)</td>
+<td>最多 10 片</td>
+</tr>
+<tr>
+<td>文件总大小</td>
+<td>5 GB</td>
+<td>超过拒绝，建议 SCP/SFTP</td>
+</tr>
+<tr>
+<td>efile_download_chunk 分块</td>
+<td>默认 5MB/块</td>
+<td>支持 Range 请求</td>
+</tr>
+</tbody>
+</table>
+<h3 id="92">9.2 令牌限制</h3>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>限制</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Token 有效期</td>
+<td>24 小时</td>
+</tr>
+<tr>
+<td>Token 续约窗口</td>
+<td>Token 签发后 24 小时内</td>
+</tr>
+<tr>
+<td>续约失败后恢复</td>
+<td>需用户重新访问认证页面</td>
+</tr>
+</tbody>
+</table>
+<h3 id="93">9.3 并发限制</h3>
+<ul>
+<li>SQLite WAL 模式未启用（单连接串行）</li>
+<li>单进程 asyncio 协程并发，非多进程并行</li>
+<li>每个用户一个续约锁，防止并发续约</li>
+</ul>
+<h3 id="94">9.4 其他限制</h3>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>限制</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>传输协议</td>
+<td>仅 <code>streamable-http</code>，不支持 <code>stdio</code></td>
+</tr>
+<tr>
+<td>请求超时</td>
+<td>默认 30s，文件上传 120s，下载 300s</td>
+</tr>
+<tr>
+<td>URL 编码</td>
+<td>路径中的空格手动替换为 <code>%20</code>，未使用 <code>urllib.parse.quote</code></td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="10">10. 风险与应急预案</h2>
+<h3 id="101">10.1 风险矩阵</h3>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>风险</th>
+<th>影响</th>
+<th>概率</th>
+<th>应对</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>R1</td>
+<td>SCNet API 变更</td>
+<td>工具调用失败</td>
+<td>低</td>
+<td>工具多为 HTTP 代理，更新 DB 即可</td>
+</tr>
+<tr>
+<td>R2</td>
+<td>Token 大面积过期</td>
+<td>所有用户暂停</td>
+<td>中</td>
+<td>自动续约机制，续约失败报错 + auth_url 引导</td>
+</tr>
+<tr>
+<td>R3</td>
+<td>存储空间不足</td>
+<td>DB 写入失败</td>
+<td>低</td>
+<td>定期清理日志，监控磁盘</td>
+</tr>
+<tr>
+<td>R4</td>
+<td>后端 URL 变更</td>
+<td>工具调用失败</td>
+<td>中</td>
+<td>用户重新认证获取最新 URLs</td>
+</tr>
+<tr>
+<td>R5</td>
+<td>SQLite 并发写入冲突</td>
+<td>请求失败</td>
+<td>低</td>
+<td>单进程架构，冲突概率低</td>
+</tr>
+</tbody>
+</table>
+<h3 id="102">10.2 应急操作</h3>
+<div class="codehilite"><pre><span></span><code><span class="c1"># 重启生产服务</span>
+bash<span class="w"> </span>restartMcp_fixed.sh<span class="w"> </span>prod
+
+<span class="c1"># 切换到测试环境（修改 MCP 客户端配置指向测试 URL）</span>
+<span class="c1"># 清理用户数据重新认证</span>
+sqlite3<span class="w"> </span>apis.db<span class="w"> </span><span class="s2">&quot;DELETE FROM users; DELETE FROM user_cluster;&quot;</span>
+</code></pre></div>
+
+<hr />
+<h2 id="11_1">11. 未来规划</h2>
+<h3 id="111-1-2">11.1 短期 (1-2 月)</h3>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>优先级</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>动态工具系统</td>
+<td>P0</td>
+<td>将 60+ 硬编码工具迁移为 DB 配置驱动</td>
+</tr>
+<tr>
+<td>路由分组架构</td>
+<td>P0</td>
+<td>拆分为 hpc/efile/ai/ac/native 多 FastMCP 实例</td>
+</tr>
+<tr>
+<td>管理 UI</td>
+<td>P1</td>
+<td><code>/admin</code> 控制面板：工具 CRUD、调用统计、日志查看</td>
+</tr>
+<tr>
+<td>OpenAPI 导入</td>
+<td>P1</td>
+<td>支持上传 OpenAPI 2.0/3.0 spec 自动生成工具</td>
+</tr>
+</tbody>
+</table>
+<h3 id="112-3-6">11.2 中期 (3-6 月)</h3>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>可观测性</td>
+<td>调用日志、错误率、P50/P95 延迟</td>
+</tr>
+<tr>
+<td>SQLite WAL 模式</td>
+<td>支持多实例并发</td>
+</tr>
+<tr>
+<td>令牌预刷新</td>
+<td>Token 过期前自动预刷新，避免运行时中断</td>
+</tr>
+<tr>
+<td>多架构部署</td>
+<td>分离认证服务与工具代理</td>
+</tr>
+</tbody>
+</table>
+<h3 id="113">11.3 长期</h3>
+<table>
+<thead>
+<tr>
+<th>项目</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>多副本水平扩展</td>
+<td>支持多 MCP 服务实例</td>
+</tr>
+<tr>
+<td>RBAC 权限</td>
+<td>基于角色的精细权限控制</td>
+</tr>
+<tr>
+<td>Webhook 通知</td>
+<td>作业完成、文件传输完成等事件通知</td>
+</tr>
+<tr>
+<td>国际化</td>
+<td>英文文档 + 多语言认证页面</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="12_1">12. 附录</h2>
+<h3 id="121">12.1 技术栈</h3>
+<table>
+<thead>
+<tr>
+<th>组件</th>
+<th>版本</th>
+<th>用途</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Python</td>
+<td>3.11+</td>
+<td>运行语言</td>
+</tr>
+<tr>
+<td>FastMCP</td>
+<td>≥3.0</td>
+<td>MCP 协议框架（StreamableHTTP）</td>
+</tr>
+<tr>
+<td>HTTPX</td>
+<td>≥0.27</td>
+<td>异步 HTTP 客户端</td>
+</tr>
+<tr>
+<td>Pydantic</td>
+<td>≥2.0</td>
+<td>参数校验与类型注解</td>
+</tr>
+<tr>
+<td>SQLite</td>
+<td>3.x</td>
+<td>嵌入式数据库</td>
+</tr>
+<tr>
+<td>Nginx</td>
+<td>1.x</td>
+<td>反向代理 + SSL 终结</td>
+</tr>
+</tbody>
+</table>
+<h3 id="122">12.2 文件清单</h3>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>main.py</code></td>
+<td>核心服务端（单文件）</td>
+</tr>
+<tr>
+<td><code>schema.sql</code></td>
+<td>数据库建表 DDL</td>
+</tr>
+<tr>
+<td><code>init_db.py</code></td>
+<td>数据库初始化 + 种子数据</td>
+</tr>
+<tr>
+<td><code>restartMcp_fixed.sh</code></td>
+<td>生产/测试环境启停脚本</td>
+</tr>
+<tr>
+<td><code>auto_commit_restart.py</code></td>
+<td>代码变更监控 + 自动重启</td>
+</tr>
+<tr>
+<td><code>pytest.ini</code></td>
+<td>测试配置</td>
+</tr>
+<tr>
+<td><code>test/conftest.py</code></td>
+<td>测试 fixtures</td>
+</tr>
+<tr>
+<td><code>test/test_efile.py</code></td>
+<td>efile 工具测试</td>
+</tr>
+<tr>
+<td><code>test/test_hpc.py</code></td>
+<td>HPC 工具测试</td>
+</tr>
+<tr>
+<td><code>test/test_container.py</code></td>
+<td>容器工具测试</td>
+</tr>
+<tr>
+<td><code>test/test_notebook.py</code></td>
+<td>Notebook 工具测试</td>
+</tr>
+<tr>
+<td><code>test/test_integration.py</code></td>
+<td>集成测试（真实 API）</td>
+</tr>
+<tr>
+<td><code>instruct/</code></td>
+<td>工具 API 文档</td>
+</tr>
+<tr>
+<td><code>doc/mcp-gateway-design.md</code></td>
+<td>架构重构设计方案</td>
+</tr>
+</tbody>
+</table>
+<h3 id="123">12.3 关键术语</h3>
+<table>
+<thead>
+<tr>
+<th>术语</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>AK</strong></td>
+<td>Access Key，用户会话标识</td>
+</tr>
+<tr>
+<td><strong>SK</strong></td>
+<td>Secret Key，用户密钥（仅首次验证使用）</td>
+</tr>
+<tr>
+<td><strong>acToken</strong></td>
+<td>平台级令牌，用于用户信息查询和跨集群操作</td>
+</tr>
+<tr>
+<td><strong>clusterToken</strong></td>
+<td>集群级令牌，用于单集群内的 HPC/eFile/AI 操作</td>
+</tr>
+<tr>
+<td><strong>MCP</strong></td>
+<td>Model Context Protocol，AI Agent 工具调用协议</td>
+</tr>
+<tr>
+<td><strong>StreamableHTTP</strong></td>
+<td>MCP 传输模式，基于 HTTP SSE 长连接</td>
+</tr>
+<tr>
+<td><strong>一致性哈希</strong></td>
+<td>通过 hash 固定 URL 选择，避免跨后端不一致</td>
+</tr>
+</tbody>
+</table>
+<h3 id="124">12.4 变更历史</h3>
+<table>
+<thead>
+<tr>
+<th>日期</th>
+<th>版本</th>
+<th>变更内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>2026-07-07</td>
+<td>v2.0</td>
+<td>当前生产版本，60+ 工具，7 个 bug 修复完成</td>
+</tr>
+</tbody>
+</table>
+    </div>
+</body>
+</html>

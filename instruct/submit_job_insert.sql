@@ -12,14 +12,14 @@ INSERT OR REPLACE INTO APIs (name, document) VALUES (
                     "description": "从 hpc_hpc_list_available_partitions 返回结果中选定的集群 ID",
                     "optional": false
                 },
-                "queueName": {
+                "GAP_QUEUE": {
                     "type": "string",
-                    "description": "从选定集群的 queues 列表中选择的目标队列名称（对应队列对象的 queName 字段）",
+                    "description": "队列名称。可从 hpc_list_available_partitions 返回的 queues 列表中获取（对应 queueName 字段）",
                     "optional": false
                 },
                 "GAP_CMD_FILE": {
                     "type": "string",
-                    "description": "作业要执行的命令行内容（如需换行，使用 \\n 转义），例如 sleep 500 或 python train.py",
+                    "description": "命令行内容（如需换行，请使用 \\n），例如 sleep 500 或 python train.py",
                     "optional": false
                 },
                 "GAP_NNODE": {

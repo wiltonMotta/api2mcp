@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "scnet-api2mcp": {
+      "type": "streamable_http",
+      "url": "https://c-2056205187675406338.qdai.scnet.cn:58043/mcp/ac1npa3sf2"
+    }
+  }
+}

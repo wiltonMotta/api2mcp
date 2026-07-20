@@ -55,8 +55,8 @@ Body:
 | 参数名 | 类型 | 必填 | 默认值 / 来源说明 |
 |--------|------|------|-------------------|
 | `clusterId` | integer | 是 | 从 `hpc_hpc_list_available_partitions` 返回结果中选定的集群 ID |
-| `queueName` | string | 是 | 从选定集群的 `queues` 列表中选择的目标队列名称（对应队列对象的 `queName` 字段） |
-| `GAP_CMD_FILE` | string | 是 | 作业要执行的命令行内容（如需换行，使用 `\n` 转义）。例如：`sleep 500`、`python train.py` |
+| `GAP_QUEUE` | string | 是 | 队列名称。可从 `hpc_list_available_partitions` 返回的 `queues` 列表中获取（对应 `queueName` 字段） |
+| `GAP_CMD_FILE` | string | 是 | 命令行内容（如需换行，请使用 `\n`）。例如：`sleep 500`、`python train.py` |
 | `GAP_NNODE` | string | 否 | 节点个数。与 `GAP_NODE_STRING` 互斥——两者不能同时填写有效值。默认 `"1"` |
 | `GAP_NODE_STRING` | string | 否 | 指定具体节点。与 `GAP_NNODE` 互斥——两者不能同时填写有效值。默认 `""` |
 | `GAP_WALL_TIME` | string | 否 | 最大运行时长，格式 `HH:MM:ss`。默认 `"24:00:00"` |

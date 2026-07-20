@@ -18,7 +18,27 @@
       "Bash(python3 *)",
       "Bash(git checkout *)",
       "Bash(grep *)",
-      "Bash(pip show *)"
+      "Bash(pip show *)",
+      "Bash(nginx -T)",
+      "Bash(systemctl status *)",
+      "Bash(sqlite3 *)",
+      "Bash(bash *)",
+      "Bash(sudo -n -l)",
+      "Bash(sudo kill 1004282 1013607)",
+      "Bash(echo \"Exit code: $?\")",
+      "Bash(pip install *)",
+      "Bash(env)",
+      "Bash(/work/home/scnkt47u2f/sun/Download/nginx/sbin/nginx *)",
+      "Bash(kill -HUP 1028769)",
+      "Bash(chmod 777 restartMcp_fixed.sh)",
+      "Bash(chown sunjg:sunjgrp restartMcp_fixed.sh)",
+      "Bash(chmod -R 777 /tmp)",
+      "Bash(kill 1633772)",
+      "Bash(echo 'sunjg ALL=\\(root\\) NOPASSWD: /usr/bin/kill')",
+      "Bash(visudo -c -f /etc/sudoers.d/sunjg-kill)",
+      "Bash(ps -eo pid,user,cmd)",
+      "Bash(sed -i '/gzip off;/d' /root/private_data/sun/Download/nginx/conf/vllm-proxy.conf)",
+      "Bash(/root/private_data/sun/Download/nginx/sbin/nginx -t)"
     ]
   }
 }

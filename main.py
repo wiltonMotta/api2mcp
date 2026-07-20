@@ -58,7 +58,7 @@ HTTP_STREAM_CHUNK_SIZE = 4 * 1024 * 1024  # 4 MB
 # File size threshold for inline vs chunked/download-link mode
 # Files ≤ this size are returned inline as base64; larger files use
 # chunked download or generate a direct download link.
-B64_INLINE_THRESHOLD = 10 * 1024 * 1024  # ~7.5 MB raw = 10 MB base64
+B64_INLINE_THRESHOLD = 200 * 1024  # ~150 KB raw = 200 KB base64 — small enough for safe SSE transport
 
 # Default chunk size for chunked download (raw bytes)
 CHUNK_DOWNLOAD_SIZE = 5 * 1024 * 1024  # 5 MB
@@ -137,9 +137,18 @@ async def _b64encode_stream(raw_bytes_iter) -> str:
 
 DB_PATH = os.environ.get("MCP_DB_PATH", "apis.db")
 
-SCNET_TOKEN_URL = "https://api.scnet.cn/api/user/v3/tokens"
-SCNET_CENTER_URL = "https://www.scnet.cn/ac/openapi/v2/center"
-SCNET_USER_URL = "https://www.scnet.cn/ac/openapi/v2/user"
+SCNET_TOKEN_URL = os.environ.get(
+    "SCNET_TOKEN_URL",
+    "https://api.scnet.cn/api/user/v3/tokens"
+)
+SCNET_CENTER_URL = os.environ.get(
+    "SCNET_CENTER_URL",
+    "https://www.scnet.cn/ac/openapi/v2/center"
+)
+SCNET_USER_URL = os.environ.get(
+    "SCNET_USER_URL",
+    "https://www.scnet.cn/ac/openapi/v2/user"
+)
 
 TYPE_MAP: dict[str, type] = {
     "integer": int,
@@ -219,7 +228,7 @@ AUTH_PAGE_HTML = """\
   <p class="access-key">Access Key: <strong>{access_key}</strong></p>
   <p class="info">Enter your SCNet userName and Secret Key.
      Find the Secret Key in the personal center under <strong>Access Control</strong>.</p>
-  <form method="POST" action="/auth/{access_key}">
+  <form method="POST" action="/{auth_prefix}/{access_key}">
     <label>SCNet userName
       <input type="text" name="userName" required placeholder="Your SCNet userName">
     </label>
@@ -288,7 +297,7 @@ ERROR_PAGE_HTML = """\
   <div class="icon">&#10008;</div>
   <h1>Authentication Failed</h1>
   <p>{message}</p>
-  <a href="/auth/{username}">Try again</a>
+  <a href="/{auth_prefix}/{username}">Try again</a>
 </div>
 </body>
 </html>"""
@@ -297,10 +306,49 @@ ERROR_PAGE_HTML = """\
 # Database helpers
 # ---------------------------------------------------------------------------
 
-# Round-robin URL index context for P1-3 (replaces random.choice)
-_url_idx_ctx: dict[str, int] = {}
+# Consistent URL picker via hashing (replaces round-robin which breaks cross-backend consistency)
+# Same path → always same backend, avoiding "file not found" across different efile servers
+_url_idx_ctx: dict[str, int] = {}  # kept for backward compat, no longer used for primary pick
+
+
+def _pick_url(valid_urls: list[str], hash_key: str) -> tuple[str, int]:
+    """Pick a URL from *valid_urls* using consistent hashing of *hash_key*.
+
+    Returns ``(url, index)``.  The same *hash_key* always yields the same
+    index, so a file operation on a given path always hits the same backend.
+    """
+    n = len(valid_urls)
+    if n == 1:
+        return valid_urls[0], 0
+    idx = abs(hash(hash_key)) % n
+    return valid_urls[idx], idx
 
 mcp = FastMCP("SCNet OpenAPI MCP Server", on_duplicate="ignore")
+
+
+def _require_params(**kwargs: Any) -> dict | None:
+    """Validate that required parameters are provided.
+
+    For each keyword argument, if value is ``None`` or empty string, returns
+    an error dict.  Returns ``None`` when all params are present.
+    """
+    missing = [name for name, val in kwargs.items() if val is None or (isinstance(val, str) and not val.strip())]
+    if missing:
+        return {
+            "error": True,
+            "message": f"缺少必填参数: {', '.join(missing)}。请提供所有必填参数后重试。",
+        }
+    return None
+
+
+def _fmt_exc(exc: Exception) -> str:
+    """Return a meaningful string for *exc*, handling httpx/SDK exceptions with empty str()."""
+    msg = str(exc)
+    if not msg.strip():
+        msg = type(exc).__name__
+        if hasattr(exc, "request") and hasattr(exc.request, "url"):
+            msg += f" on {exc.request.url}"
+    return msg
 
 
 def _efile_url(base_url: str, path: str) -> str:
@@ -364,7 +412,14 @@ def migrate_db() -> None:
 # Auth utilities
 # ---------------------------------------------------------------------------
 
-AUTH_BASE_URL = "https://c-2056205187675406338.qdai.scnet.cn:58043"
+AUTH_PREFIX = os.environ.get("MCP_AUTH_PREFIX", "auth")
+AUTH_BASE_URL = os.environ.get(
+    "MCP_AUTH_BASE_URL",
+    "https://c-2056205187675406338.qdai.scnet.cn:58043"
+)
+
+AUTH_PAGE_ROUTE = f"/{AUTH_PREFIX}/"
+AUTH_SUBMIT_ROUTE = f"/{AUTH_PREFIX}/{{accessKey}}"
 
 
 def check_auth(access_key: str) -> sqlite3.Row | dict:
@@ -373,12 +428,31 @@ def check_auth(access_key: str) -> sqlite3.Row | dict:
     Returns the database ``Row`` on success (with a valid ``acToken``),
     or an error ``dict`` with ``error=True``, ``message``, and
     ``auth_url`` fields when not authenticated.
+
+    If the *access_key* does not match any ``accessKey`` column, fall back
+    to looking it up by ``userName`` and using the stored ``accessKey`` for
+    the auth_url.  This covers the common mistake of putting the userName
+    in the URL path instead of the accessKey.
     """
     conn = get_db()
     try:
         row = conn.execute(
-            "SELECT userName, acToken FROM users WHERE accessKey = ?", (access_key,)
+            "SELECT userName, accessKey, acToken FROM users WHERE accessKey = ?",
+            (access_key,),
         ).fetchone()
+
+        # Fallback: treat the URL segment as a userName and look up the
+        # real accessKey so the auth_url points to the correct credential.
+        if row is None:
+            row = conn.execute(
+                "SELECT userName, accessKey, acToken FROM users WHERE userName = ?",
+                (access_key,),
+            ).fetchone()
+
+            # When we resolved by userName, replace the *access_key* value
+            # in the error dict below by the real accessKey.
+            if row is not None:
+                access_key = row["accessKey"]
     finally:
         conn.close()
 
@@ -474,6 +548,11 @@ def _get_current_access_key() -> str:
 def get_current_username() -> str:
     """Resolve the current accessKey → userName via DB lookup.
 
+    Tries accessKey first; if that fails, falls back to looking up by
+    userName.  This mirrors check_auth()'s fallback — users sometimes put
+    their userName (not accessKey) in the URL path segment, so both
+    mappings (accessKey→userName and userName→accessKey) are handled.
+
     Returns the SCNet userName if found, empty string otherwise.
     """
     access_key = _get_current_access_key()
@@ -484,6 +563,10 @@ def get_current_username() -> str:
         row = conn.execute(
             "SELECT userName FROM users WHERE accessKey = ?", (access_key,)
         ).fetchone()
+        if row is None:
+            row = conn.execute(
+                "SELECT userName FROM users WHERE userName = ?", (access_key,)
+            ).fetchone()
     finally:
         conn.close()
     return row["userName"] if row else ""
@@ -503,8 +586,14 @@ def hmac_sha256_sign(secret_key: str, payload: dict) -> str:
 # Token renewal — transparent refresh when SCNet returns code 10008
 # ---------------------------------------------------------------------------
 
-SCNET_RENEW_TOKEN_URL = "https://www.scnet.cn/ac/openapi/v2/tokens/next"
-SCNET_TOKEN_STATE_URL = "https://www.scnet.cn/ac/openapi/v2/tokens/state"
+SCNET_RENEW_TOKEN_URL = os.environ.get(
+    "SCNET_RENEW_TOKEN_URL",
+    "https://www.scnet.cn/ac/openapi/v2/tokens/next"
+)
+SCNET_TOKEN_STATE_URL = os.environ.get(
+    "SCNET_TOKEN_STATE_URL",
+    "https://www.scnet.cn/ac/openapi/v2/tokens/state"
+)
 
 # Per-user lock to avoid concurrent token renewal for the same user
 _token_renewal_locks: dict[str, asyncio.Lock] = {}
@@ -564,7 +653,7 @@ async def _renew_token_via_api(old_token: str) -> tuple[bool, str]:
         # code 10008 or other error → cannot renew
         return False, data.get("msg", "Token 续约失败（可能已超过 24 小时）")
     except Exception as exc:
-        return False, f"Token 续约请求异常: {exc}"
+        return False, f"Token 续约请求异常 ({type(exc).__name__}): {exc}"
 
 
 async def _check_token_valid(token: str) -> bool:
@@ -717,7 +806,7 @@ async def _call_scnet_with_renewal(
                 "message": f"请求失败 (HTTP {exc.response.status_code}): {exc.response.text[:500]}",
             }
     except Exception as exc:
-        return {"error": True, "message": f"请求异常: {exc}"}
+        return {"error": True, "message": f"请求异常 ({type(exc).__name__}): {exc}"}
 
     # If token is not expired, return as-is
     if not _is_token_expired_response(data):
@@ -728,7 +817,8 @@ async def _call_scnet_with_renewal(
         username, token, token_type, cluster_id,
     )
     if not ok:
-        return _build_auth_error(username, f"Token 续约失败: {result}")
+        access_key = _get_current_access_key()
+        return _build_auth_error(access_key, f"Token 续约失败: {result}")
 
     # Retry with the new token
     new_token = result
@@ -754,7 +844,7 @@ async def _call_scnet_with_renewal(
         # Retry succeeded but response still has non-zero code — ensure auth_url
         return _maybe_add_auth_url(data, access_key)
     except Exception as exc:
-        return {"error": True, "message": f"重试请求异常: {exc}"}
+        return {"error": True, "message": f"重试请求异常 ({type(exc).__name__}): {exc}"}
 
 
 # ---------------------------------------------------------------------------
@@ -911,13 +1001,13 @@ def register_apis(server: FastMCP, db_path: str = DB_PATH) -> int:
 # Custom HTTP routes — auth page
 # ---------------------------------------------------------------------------
 
-@mcp.custom_route("/auth/{accessKey}", methods=["GET"])
+@mcp.custom_route(f"/{AUTH_PREFIX}/{{accessKey}}", methods=["GET"])
 async def auth_page(request: Request) -> HTMLResponse:
     access_key = html_mod.escape(request.path_params["accessKey"])
-    return HTMLResponse(AUTH_PAGE_HTML.format(access_key=access_key, error_html=""))
+    return HTMLResponse(AUTH_PAGE_HTML.format(access_key=access_key, error_html="", auth_prefix=AUTH_PREFIX))
 
 
-@mcp.custom_route("/auth/{accessKey}", methods=["POST"])
+@mcp.custom_route(f"/{AUTH_PREFIX}/{{accessKey}}", methods=["POST"])
 async def auth_submit(request: Request) -> HTMLResponse:
     access_key = request.path_params["accessKey"]
     safe_access_key = html_mod.escape(access_key)
@@ -931,6 +1021,7 @@ async def auth_submit(request: Request) -> HTMLResponse:
             AUTH_PAGE_HTML.format(
                 access_key=safe_access_key,
                 error_html='<p class="error">SCNet userName and Secret Key are required.</p>',
+                auth_prefix=AUTH_PREFIX,
             ),
             status_code=400,
         )
@@ -978,6 +1069,7 @@ async def auth_submit(request: Request) -> HTMLResponse:
                 ERROR_PAGE_HTML.format(
                     username=safe_access_key,
                     message=hint,
+                    auth_prefix=AUTH_PREFIX,
                 ),
                 status_code=400,
             )
@@ -987,6 +1079,7 @@ async def auth_submit(request: Request) -> HTMLResponse:
                 username=safe_access_key,
                 message=f"SCNet API error (HTTP {exc.response.status_code}): "
                         f"{exc.response.text[:300]}",
+                auth_prefix=AUTH_PREFIX,
             ),
             status_code=502,
         )
@@ -995,6 +1088,7 @@ async def auth_submit(request: Request) -> HTMLResponse:
             ERROR_PAGE_HTML.format(
                 username=safe_access_key,
                 message=f"Request failed: {html_mod.escape(str(exc))}",
+                auth_prefix=AUTH_PREFIX,
             ),
             status_code=502,
         )
@@ -1246,7 +1340,7 @@ async def get_user_info() -> dict:
     except Exception as exc:
         return {
             "error": True,
-            "message": f"请求异常: {exc}",
+            "message": f"请求异常 ({type(exc).__name__}): {exc}",
         }
 
     # Auto-generate document and store in APIs table
@@ -1328,10 +1422,8 @@ async def hpc_list_available_partitions() -> list[dict]:
         if not valid_urls:
             continue
 
-        # Round-robin via index counter
-        _url_idx = _url_idx_ctx.get(str(cid), 0)
-        base_url = valid_urls[_url_idx % len(valid_urls)]
-        _url_idx_ctx[str(cid)] = _url_idx + 1
+        # Consistent hash URL selection
+        base_url, _ = _pick_url(valid_urls, str(cid))
 
         cluster_result: dict = {"clusterId": cid, "clusterName": cname, "jobManagerID": job_manager_id}
 
@@ -1357,12 +1449,12 @@ async def hpc_list_available_partitions() -> list[dict]:
             if isinstance(queues, list):
                 queues = [
                     q for q in queues
-                    if isinstance(q, dict) and q.get("queFreeNcpus", 0) != 0
+                    if isinstance(q, dict) and int(q.get("queFreeNcpus", 0)) != 0
                 ]
                 for q in queues:
                     q.pop("aclHosts", None)
             elif isinstance(queues, dict):
-                if queues.get("queFreeNcpus", 0) == 0:
+                if int(queues.get("queFreeNcpus", 0)) == 0:
                     queues = []
                 else:
                     queues.pop("aclHosts", None)
@@ -1403,8 +1495,8 @@ async def hpc_list_available_partitions() -> list[dict]:
 
 @mcp.tool()
 async def hpc_submit_job(
-    queueName: str,
-    GAP_CMD_FILE: str,
+    GAP_QUEUE: Annotated[str, Field(description="队列名称。可从 hpc_list_available_partitions 返回的 queues 列表中获取（对应 queueName 字段）")],
+    GAP_CMD_FILE: Annotated[str, Field(description="命令行内容（如需换行，请使用 \\n）")],
     clusterId: Annotated[Optional[int], Field(description="集群 ID。如果省略，使用当前默认集群；如果提供，则将该集群设为默认。")] = None,
     GAP_NNODE: Annotated[Optional[str], Field(description="节点个数。与 GAP_NODE_STRING 互斥，指定 GAP_NNODE 时 GAP_NODE_STRING 必须为 ''")] = None,
     GAP_NODE_STRING: Annotated[Optional[str], Field(description="指定具体节点。与 GAP_NNODE 互斥，指定 GAP_NODE_STRING 时 GAP_NNODE 必须为 ''")] = None,
@@ -1541,9 +1633,7 @@ async def hpc_submit_job(
             "error": True,
             "message": "集群未配置有效的 HPC 服务 URL。",
         }
-    _url_idx = _url_idx_ctx.get(str(clusterId), 0)
-    base_url = valid_urls[_url_idx % len(valid_urls)]
-    _url_idx_ctx[str(clusterId)] = _url_idx + 1
+    base_url, _ = _pick_url(valid_urls, str(clusterId))
     job_manager_id = None
 
     try:
@@ -1621,7 +1711,7 @@ async def hpc_submit_job(
         "GAP_SUBMIT_TYPE": "cmd",
         "GAP_JOB_NAME": job_name,
         "GAP_WORK_DIR": work_dir,
-        "GAP_QUEUE": queueName,
+        "GAP_QUEUE": GAP_QUEUE,
         "GAP_WALL_TIME": wall_time,
         "GAP_APPNAME": appname,
         # Optional fields — only include if provided
@@ -1672,7 +1762,7 @@ async def hpc_submit_job(
     except Exception as exc:
         return {
             "error": True,
-            "message": f"作业提交请求异常: {exc}",
+            "message": f"作业提交请求异常 ({type(exc).__name__}): {exc}",
         }
 
     # 7. Auto-register document in APIs table
@@ -1689,8 +1779,8 @@ async def hpc_submit_job(
             "format": "JSON",
             "schema": {
                 "clusterId": {"type": "integer", "description": "集群 ID。如果省略，使用当前默认集群；如果提供，则将该集群设为默认。", "optional": True},
-                "queueName": {"type": "string", "description": "从选定集群的 queues 列表中选择的目标队列名称", "optional": False},
-                "GAP_CMD_FILE": {"type": "string", "description": "作业要执行的命令行内容", "optional": False},
+                "GAP_QUEUE": {"type": "string", "description": "队列名称。可从 hpc_list_available_partitions 返回的 queues 列表中获取（对应 queueName 字段）", "optional": False},
+                "GAP_CMD_FILE": {"type": "string", "description": "命令行内容（如需换行，请使用 \\n）", "optional": False},
                 "GAP_NNODE": {"type": "string", "description": "节点个数", "optional": True},
                 "GAP_NODE_STRING": {"type": "string", "description": "指定具体节点", "optional": True},
                 "GAP_WALL_TIME": {"type": "string", "description": "最大运行时长，格式 HH:MM:ss", "optional": True},
@@ -1800,9 +1890,7 @@ async def hpc_get_running_job_detail(
             "message": "未找到有效的 HPC 服务 URL。",
         }
 
-    _url_idx = _url_idx_ctx.get(str(clusterId), 0)
-    base_url = valid_urls[_url_idx % len(valid_urls)]
-    _url_idx_ctx[str(clusterId)] = _url_idx + 1
+    base_url, _ = _pick_url(valid_urls, str(clusterId))
     job_detail_url = f"{base_url}/hpc/openapi/v2/jobs/{jobId}"
 
     try:
@@ -1826,7 +1914,7 @@ async def hpc_get_running_job_detail(
     except Exception as exc:
         return {
             "error": True,
-            "message": f"查询作业请求异常: {exc}",
+            "message": f"查询作业请求异常 ({type(exc).__name__}): {exc}",
         }
 
     if not result or result.get("data") is None:
@@ -1915,9 +2003,7 @@ async def hpc_get_history_job_detail(
             "message": "未找到有效的 HPC 服务 URL。",
         }
 
-    _idx = _url_idx_ctx.get(str(resolved["clusterId"]), 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[str(resolved["clusterId"])] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, str(resolved["clusterId"]))
 
     history_job_url = f"{base_url}/hpc/openapi/v2/historyjobs/{jobmanagerId}/{jobId}"
 
@@ -1947,7 +2033,7 @@ async def hpc_get_history_job_detail(
     except Exception as exc:
         return {
             "error": True,
-            "message": f"查询历史作业请求异常: {exc}",
+            "message": f"查询历史作业请求异常 ({type(exc).__name__}): {exc}",
         }
 
     if not result or result.get("data") is None:
@@ -2129,8 +2215,17 @@ async def hpc_list_history_jobs(
     conn = get_db()
     try:
         ac_row = conn.execute(
-            "SELECT acToken FROM users WHERE accessKey = ?", (access_key,)
+            "SELECT acToken, accessKey FROM users WHERE accessKey = ?", (access_key,)
         ).fetchone()
+
+        # Fallback: treat URL segment as userName and look up the real accessKey
+        if ac_row is None:
+            ac_row = conn.execute(
+                "SELECT acToken, accessKey FROM users WHERE userName = ?",
+                (access_key,),
+            ).fetchone()
+            if ac_row is not None:
+                access_key = ac_row["accessKey"]
     finally:
         conn.close()
 
@@ -2194,7 +2289,7 @@ async def hpc_list_history_jobs(
     except Exception as exc:
         return {
             "error": True,
-            "message": f"查询历史作业列表请求异常: {exc}",
+            "message": f"查询历史作业列表请求异常 ({type(exc).__name__}): {exc}",
         }
 
     # 4. Auto-register document in APIs table
@@ -2264,8 +2359,17 @@ async def hpc_list_running_jobs(
     conn = get_db()
     try:
         ac_row = conn.execute(
-            "SELECT acToken FROM users WHERE accessKey = ?", (access_key,)
+            "SELECT acToken, accessKey FROM users WHERE accessKey = ?", (access_key,)
         ).fetchone()
+
+        # Fallback: treat URL segment as userName and look up the real accessKey
+        if ac_row is None:
+            ac_row = conn.execute(
+                "SELECT acToken, accessKey FROM users WHERE userName = ?",
+                (access_key,),
+            ).fetchone()
+            if ac_row is not None:
+                access_key = ac_row["accessKey"]
     finally:
         conn.close()
 
@@ -2317,7 +2421,7 @@ async def hpc_list_running_jobs(
     except Exception as exc:
         return {
             "error": True,
-            "message": f"查询实时作业列表请求异常: {exc}",
+            "message": f"查询实时作业列表请求异常 ({type(exc).__name__}): {exc}",
         }
 
     # 4. Auto-register document in APIs table
@@ -2519,15 +2623,14 @@ async def hpc_cancel_job(
         return {"error": True, "message": "未找到有效的 HPC 服务 URL。"}
 
     _cid = str(clusterId) if clusterId is not None else str(resolved.get("clusterId", "default"))
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     from urllib.parse import urlencode
 
     try:
         client = _get_http_client(timeout=30.0)
-        resp = await client.delete(
+        resp = await client.request(
+            "DELETE",
             f"{base_url}/hpc/openapi/v2/jobs",
             content=f"jobMethod=5&{urlencode({'strJobInfoMap': str_job_info_map})}",
             headers={
@@ -2550,7 +2653,7 @@ async def hpc_cancel_job(
     except Exception as exc:
         return {
             "error": True,
-            "message": f"取消作业请求异常: {exc}",
+            "message": f"取消作业请求异常 ({type(exc).__name__}): {exc}",
         }
 
     # 5. Auto-register document in APIs table
@@ -2643,9 +2746,7 @@ async def hpc_query_job_state(
         return {"error": True, "message": "未找到有效的 HPC 服务 URL。"}
 
     _cid = str(clusterId) if clusterId is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     try:
         client = _get_http_client(timeout=30.0)
@@ -2667,7 +2768,7 @@ async def hpc_query_job_state(
             "status_code": exc.response.status_code,
         }
     except Exception as exc:
-        return {"error": True, "message": f"查询作业状态统计请求异常: {exc}"}
+        return {"error": True, "message": f"查询作业状态统计请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -2753,9 +2854,7 @@ async def hpc_query_core_num(
         return {"error": True, "message": "未找到有效的 HPC 服务 URL。"}
 
     _cid = str(clusterId) if clusterId is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     try:
         client = _get_http_client(timeout=30.0)
@@ -2776,7 +2875,7 @@ async def hpc_query_core_num(
             "status_code": exc.response.status_code,
         }
     except Exception as exc:
-        return {"error": True, "message": f"查询核心数状态统计请求异常: {exc}"}
+        return {"error": True, "message": f"查询核心数状态统计请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -2862,9 +2961,7 @@ async def hpc_query_queue_jobs(
         return {"error": True, "message": "未找到有效的 HPC 服务 URL。"}
 
     _cid = str(clusterId) if clusterId is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     try:
         client = _get_http_client(timeout=30.0)
@@ -2886,7 +2983,12 @@ async def hpc_query_queue_jobs(
             "status_code": exc.response.status_code,
         }
     except Exception as exc:
-        return {"error": True, "message": f"查询队列作业统计请求异常: {exc}"}
+        err_name = type(exc).__name__
+        err_msg = str(exc) or repr(exc)
+        print(f"[DEBUG hpc_query_queue_jobs] error={err_name} msg={err_msg} base_url={base_url} params={{'userName': {username}}}")
+        import traceback
+        print(f"[DEBUG hpc_query_queue_jobs] traceback:\n{traceback.format_exc()}")
+        return {"error": True, "message": f"查询队列作业统计请求异常: {err_name}: {err_msg}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -2972,9 +3074,7 @@ async def hpc_query_user_quota(
         return {"error": True, "message": "未找到有效的 HPC 服务 URL。"}
 
     _cid = str(clusterId) if clusterId is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     try:
         client = _get_http_client(timeout=30.0)
@@ -2995,7 +3095,7 @@ async def hpc_query_user_quota(
             "status_code": exc.response.status_code,
         }
     except Exception as exc:
-        return {"error": True, "message": f"查询共享存储配额请求异常: {exc}"}
+        return {"error": True, "message": f"查询共享存储配额请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -3081,9 +3181,7 @@ async def hpc_query_used_time(
         return {"error": True, "message": "未找到有效的 HPC 服务 URL。"}
 
     _cid = str(clusterId) if clusterId is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     try:
         client = _get_http_client(timeout=30.0)
@@ -3104,7 +3202,7 @@ async def hpc_query_used_time(
             "status_code": exc.response.status_code,
         }
     except Exception as exc:
-        return {"error": True, "message": f"查询已用机时请求异常: {exc}"}
+        return {"error": True, "message": f"查询已用机时请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -3137,7 +3235,7 @@ async def hpc_query_used_time(
 
 @mcp.tool()
 async def efile_list_files(
-    path: Annotated[str, Field(description="目标文件夹路径（必须为绝对路径）。为空时默认为用户家目录")] = "",
+    path: Annotated[Optional[str], Field(description="目标文件夹路径（必须为绝对路径）。为空时默认为用户家目录")] = None,
     keyword: Annotated[str, Field(description="搜索关键字，模糊匹配文件/文件夹名称")] = "",
     order: Annotated[str, Field(description="排序方式：asc（升序）或 desc（降序）")] = "asc",
     order_by: Annotated[str, Field(description="排序字段：name（文件名）、size（文件大小）、lastModifiedTime（修改时间）")] = "name",
@@ -3215,9 +3313,7 @@ async def efile_list_files(
         return {"error": True, "message": "未找到有效的文件服务 URL。"}
 
     _cid = str(clusterId) if clusterId is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     # 4. Call efile API (with transparent token renewal on code 10008)
     result = await _call_scnet_with_renewal(
@@ -3306,11 +3402,15 @@ async def efile_list_files(
 
 @mcp.tool()
 async def efile_touch(
-    path: Annotated[str, Field(description="要创建的文件的绝对路径（含文件名）")],
+    path: Annotated[Optional[str], Field(description="要创建的文件的绝对路径（含文件名）")] = None,
     clusterId: Annotated[Optional[int], Field(description="集群 ID。为空时使用默认集群")] = None,
 ) -> dict:
     """在 HPC 集群文件系统上创建空文件。"""
     username = get_current_username()
+
+    err = _require_params(path=path)
+    if err:
+        return err
 
     auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
@@ -3350,9 +3450,7 @@ async def efile_touch(
         return {"error": True, "message": "未找到有效的文件服务 URL。"}
 
     _cid = str(clusterId) if clusterId is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     try:
         client = _get_http_client(timeout=30.0)
@@ -3370,7 +3468,7 @@ async def efile_touch(
             "message": f"创建文件失败 (HTTP {exc.response.status_code})。详情: {exc.response.text[:500]}",
         }
     except Exception as exc:
-        return {"error": True, "message": f"创建文件请求异常: {exc}"}
+        return {"error": True, "message": f"创建文件请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -3401,8 +3499,8 @@ async def efile_touch(
 
 @mcp.tool()
 async def efile_check_permission(
-    path: Annotated[str, Field(description="所校验文件的绝对路径")],
-    permission_action: Annotated[str, Field(description="权限类型：READ（读）、WRITE（写）、EXECUTE（执行）")],
+    path: Annotated[Optional[str], Field(description="所校验文件的绝对路径")] = None,
+    permission_action: Annotated[Optional[str], Field(description="权限类型：READ（读）、WRITE（写）、EXECUTE（执行）")] = None,
     clusterId: Annotated[Optional[int], Field(description="集群 ID。为空时使用默认集群（isDefault=true）")] = None,
 ) -> dict:
     """校验当前用户对指定文件是否具有读、写或执行权限。"""
@@ -3452,9 +3550,7 @@ async def efile_check_permission(
         return {"error": True, "message": "未找到有效的文件服务 URL。"}
 
     _cid = str(clusterId) if clusterId is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     try:
         client = _get_http_client(timeout=30.0)
@@ -3472,7 +3568,7 @@ async def efile_check_permission(
             "message": f"权限校验失败 (HTTP {exc.response.status_code})。详情: {exc.response.text[:500]}",
         }
     except Exception as exc:
-        return {"error": True, "message": f"权限校验请求异常: {exc}"}
+        return {"error": True, "message": f"权限校验请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -3504,13 +3600,17 @@ async def efile_check_permission(
 
 @mcp.tool()
 async def efile_move(
-    source_paths: Annotated[str, Field(description="源文件绝对路径，支持批量。多个文件路径用英文逗号分隔")],
-    target_path: Annotated[str, Field(description="目标目录绝对路径")],
+    source_paths: Annotated[Optional[str], Field(description="源文件绝对路径，支持批量。多个文件路径用英文逗号分隔")] = None,
+    target_path: Annotated[Optional[str], Field(description="目标目录绝对路径")] = None,
     cover: Annotated[str, Field(description="覆盖策略：cover（强制覆盖）或 uncover（不覆盖）")] = "uncover",
     clusterId: Annotated[Optional[int], Field(description="集群 ID。为空时使用默认集群")] = None,
 ) -> dict:
     """在 HPC 集群文件系统上移动文件，支持批量移动（多个源文件逗号分隔）。"""
     username = get_current_username()
+
+    err = _require_params(source_paths=source_paths, target_path=target_path)
+    if err:
+        return err
 
     auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
@@ -3550,9 +3650,7 @@ async def efile_move(
         return {"error": True, "message": "未找到有效的文件服务 URL。"}
 
     _cid = str(clusterId) if clusterId is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     try:
         client = _get_http_client(timeout=30.0)
@@ -3574,7 +3672,7 @@ async def efile_move(
             "message": f"移动文件失败 (HTTP {exc.response.status_code})。详情: {exc.response.text[:500]}",
         }
     except Exception as exc:
-        return {"error": True, "message": f"移动文件请求异常: {exc}"}
+        return {"error": True, "message": f"移动文件请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -3615,6 +3713,10 @@ async def efile_copy(
     """在 HPC 集群文件系统上复制文件，支持批量复制（多个源文件逗号分隔）。"""
     username = get_current_username()
 
+    err = _require_params(source_paths=source_paths, target_path=target_path)
+    if err:
+        return err
+
     auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
@@ -3653,9 +3755,7 @@ async def efile_copy(
         return {"error": True, "message": "未找到有效的文件服务 URL。"}
 
     _cid = str(clusterId) if clusterId is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     try:
         client = _get_http_client(timeout=30.0)
@@ -3677,7 +3777,7 @@ async def efile_copy(
             "message": f"复制文件失败 (HTTP {exc.response.status_code})。详情: {exc.response.text[:500]}",
         }
     except Exception as exc:
-        return {"error": True, "message": f"复制文件请求异常: {exc}"}
+        return {"error": True, "message": f"复制文件请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -3710,12 +3810,16 @@ async def efile_copy(
 
 @mcp.tool()
 async def efile_rename(
-    path: Annotated[str, Field(description="源文件绝对路径")],
-    new_name: Annotated[str, Field(description="文件修改后的新名称（仅文件名，不含路径）")],
+    path: Annotated[Optional[str], Field(description="源文件绝对路径")] = None,
+    new_name: Annotated[Optional[str], Field(description="文件修改后的新名称（仅文件名，不含路径）")] = None,
     clusterId: Annotated[Optional[int], Field(description="集群 ID。为空时使用默认集群")] = None,
 ) -> dict:
     """重命名 HPC 集群文件系统上的文件。"""
     username = get_current_username()
+
+    err = _require_params(path=path, new_name=new_name)
+    if err:
+        return err
 
     auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
@@ -3755,9 +3859,7 @@ async def efile_rename(
         return {"error": True, "message": "未找到有效的文件服务 URL。"}
 
     _cid = str(clusterId) if clusterId is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     try:
         client = _get_http_client(timeout=30.0)
@@ -3775,7 +3877,7 @@ async def efile_rename(
             "message": f"重命名文件失败 (HTTP {exc.response.status_code})。详情: {exc.response.text[:500]}",
         }
     except Exception as exc:
-        return {"error": True, "message": f"重命名文件请求异常: {exc}"}
+        return {"error": True, "message": f"重命名文件请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -3807,12 +3909,16 @@ async def efile_rename(
 
 @mcp.tool()
 async def efile_delete(
-    paths: Annotated[str, Field(description="删除文件的绝对路径，多个路径用英文逗号分隔")],
+    paths: Annotated[Optional[str], Field(description="删除文件的绝对路径，多个路径用英文逗号分隔")] = None,
     recursive: Annotated[bool, Field(description="是否递归删除。true 可删除非空文件夹")] = False,
     clusterId: Annotated[Optional[int], Field(description="集群 ID。为空时使用默认集群")] = None,
 ) -> dict:
     """删除 HPC 集群文件系统上的文件或文件夹，支持批量删除。"""
     username = get_current_username()
+
+    err = _require_params(paths=paths)
+    if err:
+        return err
 
     auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
@@ -3852,9 +3958,7 @@ async def efile_delete(
         return {"error": True, "message": "未找到有效的文件服务 URL。"}
 
     _cid = str(clusterId) if clusterId is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     try:
         client = _get_http_client(timeout=30.0)
@@ -3872,7 +3976,7 @@ async def efile_delete(
             "message": f"删除文件/文件夹失败 (HTTP {exc.response.status_code})。详情: {exc.response.text[:500]}",
         }
     except Exception as exc:
-        return {"error": True, "message": f"删除文件/文件夹请求异常: {exc}"}
+        return {"error": True, "message": f"删除文件/文件夹请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -3904,15 +4008,22 @@ async def efile_delete(
 
 @mcp.tool()
 async def efile_exist(
-    path: Annotated[str, Field(description="文件/文件夹的绝对路径")],
+    path: Annotated[Optional[str], Field(description="文件/文件夹的绝对路径")] = None,
     clusterId: Annotated[Optional[int], Field(description="集群 ID。为空时使用默认集群（isDefault=true）")] = None,
 ) -> dict:
     """判断指定的文件或文件夹是否存在于 HPC 集群文件系统中。"""
     username = get_current_username()
 
+    err = _require_params(path=path)
+    if err:
+        return err
+
     auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
+
+    if not path or not path.strip():
+        return {"error": True, "message": "文件路径不能为空，请提供有效的绝对路径。"}
 
     conn = get_db()
     try:
@@ -3948,9 +4059,7 @@ async def efile_exist(
         return {"error": True, "message": "未找到有效的文件服务 URL。"}
 
     _cid = str(clusterId) if clusterId is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     try:
         client = _get_http_client(timeout=30.0)
@@ -3968,7 +4077,7 @@ async def efile_exist(
             "message": f"判断文件是否存在失败 (HTTP {exc.response.status_code})。详情: {exc.response.text[:500]}",
         }
     except Exception as exc:
-        return {"error": True, "message": f"判断文件是否存在请求异常: {exc}"}
+        return {"error": True, "message": f"判断文件是否存在请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -3999,12 +4108,16 @@ async def efile_exist(
 
 @mcp.tool()
 async def efile_folder_create(
-    path: Annotated[str, Field(description="文件夹绝对路径")],
+    path: Annotated[Optional[str], Field(description="文件夹绝对路径")] = None,
     create_parents: Annotated[bool, Field(description="父目录不存在时是否自动创建")] = False,
     clusterId: Annotated[Optional[int], Field(description="集群 ID。为空时使用默认集群")] = None,
 ) -> dict:
     """在 HPC 集群文件系统上创建文件夹。"""
     username = get_current_username()
+
+    err = _require_params(path=path)
+    if err:
+        return err
 
     auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
@@ -4044,9 +4157,7 @@ async def efile_folder_create(
         return {"error": True, "message": "未找到有效的文件服务 URL。"}
 
     _cid = str(clusterId) if clusterId is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     try:
         client = _get_http_client(timeout=30.0)
@@ -4064,7 +4175,7 @@ async def efile_folder_create(
             "message": f"创建文件夹失败 (HTTP {exc.response.status_code})。详情: {exc.response.text[:500]}",
         }
     except Exception as exc:
-        return {"error": True, "message": f"创建文件夹请求异常: {exc}"}
+        return {"error": True, "message": f"创建文件夹请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -4096,13 +4207,17 @@ async def efile_folder_create(
 
 @mcp.tool()
 async def efile_preview_file(
-    path: Annotated[str, Field(description="预览文件的绝对路径")],
+    path: Annotated[Optional[str], Field(description="预览文件的绝对路径")] = None,
     force: Annotated[bool, Field(description="true 强制打开，false 默认方式")] = False,
     start_index: Annotated[int, Field(description="起始字符位置（从 0 开始）")] = 0,
     clusterId: Annotated[Optional[int], Field(description="集群 ID。为空时使用默认集群")] = None,
 ) -> dict:
     """预览 HPC 集群上的文本文件内容，支持分页读取。"""
     username = get_current_username()
+
+    err = _require_params(path=path)
+    if err:
+        return err
 
     auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
@@ -4142,9 +4257,7 @@ async def efile_preview_file(
         return {"error": True, "message": "未找到有效的文件服务 URL。"}
 
     _cid = str(clusterId) if clusterId is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     try:
         client = _get_http_client(timeout=30.0)
@@ -4166,7 +4279,7 @@ async def efile_preview_file(
             "message": f"预览文件失败 (HTTP {exc.response.status_code})。详情: {exc.response.text[:500]}",
         }
     except Exception as exc:
-        return {"error": True, "message": f"预览文件请求异常: {exc}"}
+        return {"error": True, "message": f"预览文件请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -4199,9 +4312,9 @@ async def efile_preview_file(
 
 @mcp.tool()
 async def efile_upload(
-    file_content: Annotated[str, Field(description="文件内容的 base64 编码字符串")],
-    file_name: Annotated[str, Field(description="原始文件名（如 result.txt）")],
-    remote_path: Annotated[str, Field(description="远程目标文件夹路径（必须为绝对路径）")],
+    file_content: Annotated[Optional[str], Field(description="文件内容的 base64 编码字符串")] = None,
+    file_name: Annotated[Optional[str], Field(description="原始文件名（如 result.txt）")] = None,
+    remote_path: Annotated[Optional[str], Field(description="远程目标文件夹路径（必须为绝对路径）")] = None,
     cover: Annotated[str, Field(description="覆盖策略：cover（强制覆盖）或 uncover（不覆盖）")] = "uncover",
     clusterId: Annotated[Optional[int], Field(description="集群 ID。为空时使用默认集群")] = None,
 ) -> dict:
@@ -4212,6 +4325,10 @@ async def efile_upload(
     """
     username = get_current_username()
 
+    err = _require_params(file_content=file_content, file_name=file_name, remote_path=remote_path)
+    if err:
+        return err
+
     auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
         return auth_result
@@ -4220,7 +4337,7 @@ async def efile_upload(
     try:
         file_bytes = _b64decode_stream(file_content)
     except (ValueError, Exception) as exc:
-        msg = str(exc) if isinstance(exc, ValueError) and "文件过大" in str(exc) else f"文件内容 base64 解码失败: {exc}"
+        msg = str(exc) if isinstance(exc, ValueError) and "文件过大" in str(exc) else f"文件内容 base64 解码失败 ({type(exc).__name__}): {exc}"
         return {"error": True, "message": msg}
 
     conn = get_db()
@@ -4257,9 +4374,7 @@ async def efile_upload(
         return {"error": True, "message": "未找到有效的文件服务 URL。"}
 
     _cid = str(clusterId) if clusterId is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     try:
         client = _get_http_client(timeout=30.0)
@@ -4278,7 +4393,7 @@ async def efile_upload(
             "message": f"上传文件失败 (HTTP {exc.response.status_code})。详情: {exc.response.text[:500]}",
         }
     except Exception as exc:
-        return {"error": True, "message": f"上传文件请求异常: {exc}"}
+        return {"error": True, "message": f"上传文件请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -4312,16 +4427,21 @@ async def efile_upload(
 
 @mcp.tool()
 async def efile_download(
-    path: Annotated[str, Field(description="要下载的文件/文件夹绝对路径")],
+    path: Annotated[Optional[str], Field(description="要下载的文件/文件夹绝对路径")] = None,
     clusterId: Annotated[Optional[int], Field(description="集群 ID。为空时使用默认集群")] = None,
 ) -> dict:
-    """从 HPC 集群文件系统下载文件或文件夹。
+    """从 HPC 集群文件系统下载文件或文件夹。返回含认证 token 的 HTTP 下载链接。
 
-    - **小文件（≤10 MB）**：直接返回 base64 编码内容。
-    - **大文件（>10 MB）**：返回下载链接（含 token），可通过浏览器或 curl 直接下载。
-    - 超过 5 GB 的文件将被拒绝。
+    由于后端文件系统不返回文件大小头信息，所有文件统一返回 download_url 下载链接，
+    可通过浏览器或 curl 直接下载。不再返回内联 base64 数据。
+
+    如需分块下载，请使用 efile_download_chunk 工具。
     """
     username = get_current_username()
+
+    err = _require_params(path=path)
+    if err:
+        return err
 
     auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
@@ -4361,38 +4481,30 @@ async def efile_download(
         return {"error": True, "message": "未找到有效的文件服务 URL。"}
 
     _cid = str(clusterId) if clusterId is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, path or _cid)
 
-    # First, fetch file metadata to check size
+    download_api = _efile_url(base_url, "/efile/openapi/v2/file/download")
     try:
         client = _get_http_client(timeout=30.0)
-        resp_meta = await client.get(
-            _efile_url(base_url, "/efile/openapi/v2/file/download"),
+
+        # --- Step 1: HEAD request to determine file size ---
+        head_resp = await client.request(
+            "HEAD", download_api,
             params={"path": path},
             headers={"token": token},
             timeout=30.0,
         )
 
-        content_type = resp_meta.headers.get("content-type", "")
-        # If API returns JSON (error or metadata), check file size
-        if content_type and "json" in content_type:
-            meta_json = resp_meta.json()
-            if "error" in meta_json or "code" in meta_json:
-                return meta_json
-            # Meta response may contain file_size
-            if isinstance(meta_json, dict):
-                file_size = meta_json.get("fileSize", meta_json.get("file_size", 0))
-            else:
-                file_size = 0
-        else:
-            # Binary response — check content-length header
-            cl = resp_meta.headers.get("content-length")
-            file_size = int(cl) if cl else 0
+        # If HEAD returned JSON error, return as-is
+        ct = head_resp.headers.get("content-type", "")
+        if ct and "json" in ct:
+            head_body = await head_resp.aread()
+            return json.loads(head_body)
 
-        # Derive file name
-        content_disposition = resp_meta.headers.get("content-disposition", "")
+        # Read size and file name from HEAD response headers
+        cl = head_resp.headers.get("content-length")
+        file_size = int(cl) if cl else 0
+        content_disposition = head_resp.headers.get("content-disposition", "")
         file_name = ""
         if content_disposition:
             match = re.search(r'filename[^;=\n]*=((["\']).*?\2|[^;\n]*)', content_disposition)
@@ -4401,20 +4513,18 @@ async def efile_download(
         if not file_name:
             file_name = path.rstrip("/").rsplit("/", 1)[-1] if path else "download"
 
-        # --- Small file: return inline base64 ---
-        if file_size <= B64_INLINE_THRESHOLD:
-            # Re-fetch the actual content (meta response was just for size check)
-            _validate_file_size("")  # reset any prior state
+        # --- Step 2: Decide inline vs link based on file size ---
+        if 0 < file_size <= B64_INLINE_THRESHOLD:
+            # Small file: GET full content → base64 inline
             resp = await client.get(
-                _efile_url(base_url, "/efile/openapi/v2/file/download"),
+                download_api,
                 params={"path": path},
                 headers={"token": token},
                 timeout=300.0,
             )
             resp.raise_for_status()
-
-            content_type = resp.headers.get("content-type", "")
-            if content_type and "json" in content_type:
+            ct = resp.headers.get("content-type", "")
+            if ct and "json" in ct:
                 return resp.json()
 
             if hasattr(resp, "aiter_bytes") and callable(resp.aiter_bytes):
@@ -4430,37 +4540,47 @@ async def efile_download(
                 "file_size": file_size,
                 "file_content_b64": file_content_b64,
                 "download_method": "inline",
-                "content_type": content_type or "application/octet-stream",
-                "message": f"文件较小 ({file_size / 1024 / 1024:.1f} MB)，内容已以内联 base64 形式返回。",
+                "content_type": ct or "application/octet-stream",
+                "message": f"文件大小 {file_size / 1024 / 1024:.1f} MB，内容已以内联 base64 形式返回。",
             }
 
-        # --- Large file: return download link ---
-        # Generate a direct download link with token in query string
-        download_url = (
-            f"{base_url}/efile/openapi/v2/file/download?"
-            f"path={path}&token={token}"
-        )
+        # --- Large file or unknown size: return download link ---
+        download_url = f"{download_api}?path={path}&token={token}"
+        if file_size > 0:
+            return {
+                "file_name": file_name,
+                "file_size": file_size,
+                "download_url": download_url,
+                "download_method": "link",
+                "message": (
+                    f"文件较大 ({file_size / 1024 / 1024:.1f} MB)，"
+                    f"内容太大不适合通过 MCP 协议传输。"
+                    f"\n\n"
+                    f"💡 下载方式：\n"
+                    f"  1. 浏览器直接打开: {download_url[:120]}...\n"
+                    f"  2. curl 下载: curl -H 'token: {token[:12]}...' "
+                    f"'{download_url[:120]}' -o {file_name}\n"
+                    f"\n"
+                    f"如需通过 MCP 分块下载，请使用工具: efile_download_chunk"
+                ),
+            }
+        else:
+            return {
+                "file_name": file_name,
+                "file_size": 0,
+                "download_url": download_url,
+                "download_method": "link",
+                "message": (
+                    f"文件大小未知（服务器未返回 Content-Length），"
+                    f"已为您生成长效下载链接（含 token）。\n\n"
+                    f"💡 下载方式：\n"
+                    f"  1. 浏览器直接打开: {download_url[:120]}...\n"
+                    f"  2. curl 下载: {download_url[:120]} -o {file_name}\n"
+                    f"\n"
+                    f"如需通过 MCP 分块下载，请使用工具: efile_download_chunk"
+                ),
+            }
 
-        return {
-            "file_name": file_name,
-            "file_size": file_size,
-            "download_url": download_url,
-            "download_method": "link",
-            "message": (
-                f"文件较大 ({file_size / 1024 / 1024:.1f} MB)，"
-                f"内容太大不适合通过 MCP 协议传输。"
-                f"\n\n"
-                f"💡 下载方式：\n"
-                f"  1. 浏览器直接打开: {download_url[:120]}...\n"
-                f"  2. curl 下载: curl -H 'token: {token[:12]}...' "
-                f"'{download_url[:120]}' -o {file_name}\n"
-                f"\n"
-                f"如需通过 MCP 分块下载，请使用工具: efile_download_chunk"
-            ),
-        }
-
-    except ValueError as exc:
-        return {"error": True, "message": str(exc)}
     except httpx.HTTPStatusError as exc:
         try:
             error_data = exc.response.json()
@@ -4471,7 +4591,7 @@ async def efile_download(
                 "message": f"下载文件失败 (HTTP {exc.response.status_code})。详情: {exc.response.text[:500]}",
             }
     except Exception as exc:
-        return {"error": True, "message": f"下载文件请求异常: {exc}"}
+        return {"error": True, "message": f"下载文件请求异常 ({type(exc).__name__}): {exc or 'no detail'}"}
 
 
 # ---------------------------------------------------------------------------
@@ -4492,6 +4612,10 @@ async def efile_download_chunk(
     适合通过 MCP 协议下载大文件（>10 MB），每次调用返回一个分块。
     """
     username = get_current_username()
+
+    err = _require_params(path=path)
+    if err:
+        return err
 
     auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
@@ -4536,39 +4660,85 @@ async def efile_download_chunk(
         return {"error": True, "message": "未找到有效的文件服务 URL。"}
 
     _cid = str(clusterId) if clusterId is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     start = chunk_index * chunk_size
     end = start + chunk_size - 1
 
-    # First get file size to validate chunk_index
+    # First get file size to validate chunk_index (use HEAD, avoid full download)
     try:
         client = _get_http_client(timeout=30.0)
-        resp_meta = await client.get(
-            _efile_url(base_url, "/efile/openapi/v2/file/download"),
-            params={"path": path},
-            headers={"token": token},
-            timeout=30.0,
-        )
 
-        content_type = resp_meta.headers.get("content-type", "")
-        if content_type and "json" in content_type:
-            meta_json = resp_meta.json()
-            if "error" in meta_json or "code" in meta_json:
-                return meta_json
-            file_size = meta_json.get("fileSize", meta_json.get("file_size", 0))
-        else:
-            cl = resp_meta.headers.get("content-length")
-            file_size = int(cl) if cl else 0
-
+        # 尝试 HEAD 请求（最轻量）
+        file_size = 0
         file_name = ""
-        content_disposition = resp_meta.headers.get("content-disposition", "")
-        if content_disposition:
-            match = re.search(r'filename[^;=\n]*=((["\']).*?\2|[^;\n]*)', content_disposition)
-            if match:
-                file_name = match.group(1).strip().strip('"\'')
+        try:
+            resp_head = await client.head(
+                _efile_url(base_url, "/efile/openapi/v2/file/download"),
+                params={"path": path},
+                headers={"token": token},
+                timeout=30.0,
+            )
+            cl = resp_head.headers.get("content-length")
+            file_size = int(cl) if cl else 0
+            content_disposition = resp_head.headers.get("content-disposition", "")
+            if content_disposition:
+                match = re.search(r'filename[^;=\n]*=((["\']).*?\2|[^;\n]*)', content_disposition)
+                if match:
+                    file_name = match.group(1).strip().strip('"\'')
+        except Exception:
+            pass
+
+        # HEAD 未能获取到文件大小 → 用 Range: bytes=0-0 探测
+        if file_size <= 0:
+            try:
+                resp_probe = await client.get(
+                    _efile_url(base_url, "/efile/openapi/v2/file/download"),
+                    params={"path": path},
+                    headers={"token": token, "Range": "bytes=0-0"},
+                    timeout=30.0,
+                )
+                content_range = resp_probe.headers.get("content-range", "")
+                if content_range and "/" in content_range:
+                    file_size = int(content_range.split("/")[-1])
+                else:
+                    cl = resp_probe.headers.get("content-length")
+                    file_size = int(cl) if cl else 0
+                if not file_name:
+                    content_disposition = resp_probe.headers.get("content-disposition", "")
+                    if content_disposition:
+                        match = re.search(r'filename[^;=\n]*=((["\']).*?\2|[^;\n]*)', content_disposition)
+                        if match:
+                            file_name = match.group(1).strip().strip('"\'')
+            except Exception:
+                pass
+
+        # 最后兜底：完整 GET 请求取 Content-Length（但断开连接不读 body）
+        if file_size <= 0:
+            resp_meta = await client.get(
+                _efile_url(base_url, "/efile/openapi/v2/file/download"),
+                params={"path": path},
+                headers={"token": token},
+                timeout=30.0,
+            )
+            content_type = resp_meta.headers.get("content-type", "")
+            if content_type and "json" in content_type:
+                meta_json = resp_meta.json()
+                if "error" in meta_json or "code" in meta_json:
+                    return meta_json
+                file_size = meta_json.get("fileSize", meta_json.get("file_size", 0))
+            else:
+                cl = resp_meta.headers.get("content-length")
+                file_size = int(cl) if cl else 0
+            if not file_name:
+                content_disposition = resp_meta.headers.get("content-disposition", "")
+                if content_disposition:
+                    match = re.search(r'filename[^;=\n]*=((["\']).*?\2|[^;\n]*)', content_disposition)
+                    if match:
+                        file_name = match.group(1).strip().strip('"\'')
+            # 断开响应流避免下载整个文件
+            await resp_meta.aclose()
+
         if not file_name:
             file_name = path.rstrip("/").rsplit("/", 1)[-1] if path else "download"
 
@@ -4596,8 +4766,18 @@ async def efile_download_chunk(
             timeout=60.0,
         )
 
-        if resp.status_code == 206:  # Partial Content
+        if resp.status_code in (206, 200):  # 206=标准, 200=部分服务器兼容
+            # 如果返回 200 但内容长度与请求 Range 吻合，视为成功
             chunk_data = resp.content
+            expected_len = actual_end - start + 1
+            if resp.status_code == 200 and len(chunk_data) != expected_len and len(chunk_data) >= file_size:
+                # 服务器实际返回了完整文件而非分块
+                resp.raise_for_status()
+                return {
+                    "error": True,
+                    "message": f"分块下载返回 HTTP 200 且数据长度({len(chunk_data)}B)匹配整个文件({file_size}B)，服务器不支持 Range。",
+                    "file_name": file_name,
+                }
             chunk_b64 = base64.b64encode(chunk_data).decode("ascii")
             return {
                 "file_name": file_name,
@@ -4641,7 +4821,7 @@ async def efile_download_chunk(
                 "message": f"分块下载失败 (HTTP {exc.response.status_code})。详情: {exc.response.text[:500]}",
             }
     except Exception as exc:
-        return {"error": True, "message": f"分块下载请求异常: {exc}"}
+        return {"error": True, "message": f"分块下载请求异常 ({type(exc).__name__}): {exc}"}
 
 
 @mcp.tool()
@@ -4656,6 +4836,10 @@ async def efile_get_download_link(
     适合大文件下载，避免 MCP 协议传输大体积 base64 数据。
     """
     username = get_current_username()
+
+    err = _require_params(path=path)
+    if err:
+        return err
 
     auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
@@ -4698,11 +4882,12 @@ async def efile_get_download_link(
 
     base_url = valid_urls[0]
 
-    # Encode path for URL
+    download_api = _efile_url(base_url, "/efile/openapi/v2/file/download")
+
     encoded_path = path.replace(" ", "%20")
 
     download_url = (
-        f"{base_url}/efile/openapi/v2/file/download?"
+        f"{download_api}?"
         f"path={encoded_path}&token={token}&expires={expires_in}"
     )
 
@@ -4730,7 +4915,7 @@ async def efile_get_download_link(
 
 @mcp.tool()
 async def efile_open_share(
-    file_path: Annotated[str, Field(description="要分享的文件的绝对路径")],
+    file_path: Annotated[Optional[str], Field(description="要分享的文件的绝对路径")] = None,
     valid_days: Annotated[int, Field(description="链接有效天数，默认 30 天")] = 30,
     clusterId: Annotated[Optional[int], Field(description="集群 ID。为空时使用默认集群")] = None,
 ) -> dict:
@@ -4739,6 +4924,10 @@ async def efile_open_share(
     返回包含 serverCurlLink、serverFastransLink、webLink 和有效时长。
     """
     username = get_current_username()
+
+    err = _require_params(file_path=file_path)
+    if err:
+        return err
 
     auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
@@ -4778,9 +4967,7 @@ async def efile_open_share(
         return {"error": True, "message": "未找到有效的文件服务 URL。"}
 
     _cid = str(clusterId) if clusterId is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     try:
         client = _get_http_client(timeout=30.0)
@@ -4802,7 +4989,7 @@ async def efile_open_share(
             "status_code": exc.response.status_code,
         }
     except Exception as exc:
-        return {"error": True, "message": f"开启文件分享请求异常: {exc}"}
+        return {"error": True, "message": f"开启文件分享请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -4834,11 +5021,15 @@ async def efile_open_share(
 
 @mcp.tool()
 async def efile_close_share(
-    file_path: Annotated[str, Field(description="已分享文件的绝对路径")],
+    file_path: Annotated[Optional[str], Field(description="已分享文件的绝对路径")] = None,
     clusterId: Annotated[Optional[int], Field(description="集群 ID。为空时使用默认集群")] = None,
 ) -> dict:
     """关闭指定文件的分享链接。"""
     username = get_current_username()
+
+    err = _require_params(file_path=file_path)
+    if err:
+        return err
 
     auth_result = check_auth(_get_current_access_key())
     if isinstance(auth_result, dict):
@@ -4878,9 +5069,7 @@ async def efile_close_share(
         return {"error": True, "message": "未找到有效的文件服务 URL。"}
 
     _cid = str(clusterId) if clusterId is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     try:
         client = _get_http_client(timeout=30.0)
@@ -4902,7 +5091,7 @@ async def efile_close_share(
             "status_code": exc.response.status_code,
         }
     except Exception as exc:
-        return {"error": True, "message": f"关闭文件分享请求异常: {exc}"}
+        return {"error": True, "message": f"关闭文件分享请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -4952,7 +5141,7 @@ async def efile_async_copy(
     try:
         tasks_list = json.loads(tasks)
     except json.JSONDecodeError as exc:
-        return {"error": True, "message": f"tasks 参数 JSON 解析失败: {exc}"}
+        return {"error": True, "message": f"tasks 参数 JSON 解析失败 ({type(exc).__name__}): {exc}"}
 
     if not isinstance(tasks_list, list) or len(tasks_list) == 0:
         return {"error": True, "message": "tasks 必须是非空 JSON 数组。"}
@@ -4991,9 +5180,7 @@ async def efile_async_copy(
         return {"error": True, "message": "未找到有效的文件服务 URL。"}
 
     _cid = str(clusterId) if clusterId is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     try:
         client = _get_http_client(timeout=30.0)
@@ -5015,7 +5202,7 @@ async def efile_async_copy(
             "status_code": exc.response.status_code,
         }
     except Exception as exc:
-        return {"error": True, "message": f"异步复制请求异常: {exc}"}
+        return {"error": True, "message": f"异步复制请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -5063,7 +5250,7 @@ async def efile_async_move(
     try:
         tasks_list = json.loads(tasks)
     except json.JSONDecodeError as exc:
-        return {"error": True, "message": f"tasks 参数 JSON 解析失败: {exc}"}
+        return {"error": True, "message": f"tasks 参数 JSON 解析失败 ({type(exc).__name__}): {exc}"}
 
     if not isinstance(tasks_list, list) or len(tasks_list) == 0:
         return {"error": True, "message": "tasks 必须是非空 JSON 数组。"}
@@ -5102,9 +5289,7 @@ async def efile_async_move(
         return {"error": True, "message": "未找到有效的文件服务 URL。"}
 
     _cid = str(clusterId) if clusterId is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     try:
         client = _get_http_client(timeout=30.0)
@@ -5126,7 +5311,7 @@ async def efile_async_move(
             "status_code": exc.response.status_code,
         }
     except Exception as exc:
-        return {"error": True, "message": f"异步移动请求异常: {exc}"}
+        return {"error": True, "message": f"异步移动请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -5174,7 +5359,7 @@ async def efile_async_delete(
     try:
         tasks_list = json.loads(tasks)
     except json.JSONDecodeError as exc:
-        return {"error": True, "message": f"tasks 参数 JSON 解析失败: {exc}"}
+        return {"error": True, "message": f"tasks 参数 JSON 解析失败 ({type(exc).__name__}): {exc}"}
 
     if not isinstance(tasks_list, list) or len(tasks_list) == 0:
         return {"error": True, "message": "tasks 必须是非空 JSON 数组。"}
@@ -5213,9 +5398,7 @@ async def efile_async_delete(
         return {"error": True, "message": "未找到有效的文件服务 URL。"}
 
     _cid = str(clusterId) if clusterId is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     try:
         client = _get_http_client(timeout=30.0)
@@ -5237,7 +5420,7 @@ async def efile_async_delete(
             "status_code": exc.response.status_code,
         }
     except Exception as exc:
-        return {"error": True, "message": f"异步删除请求异常: {exc}"}
+        return {"error": True, "message": f"异步删除请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -5284,7 +5467,7 @@ async def efile_async_task_cancel(
     try:
         task_ids_list = json.loads(task_ids)
     except json.JSONDecodeError as exc:
-        return {"error": True, "message": f"task_ids 参数 JSON 解析失败: {exc}"}
+        return {"error": True, "message": f"task_ids 参数 JSON 解析失败 ({type(exc).__name__}): {exc}"}
 
     if not isinstance(task_ids_list, list) or len(task_ids_list) == 0:
         return {"error": True, "message": "task_ids 必须是非空 JSON 数组。"}
@@ -5323,9 +5506,7 @@ async def efile_async_task_cancel(
         return {"error": True, "message": "未找到有效的文件服务 URL。"}
 
     _cid = str(clusterId) if clusterId is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     try:
         client = _get_http_client(timeout=30.0)
@@ -5347,7 +5528,7 @@ async def efile_async_task_cancel(
             "status_code": exc.response.status_code,
         }
     except Exception as exc:
-        return {"error": True, "message": f"取消异步任务请求异常: {exc}"}
+        return {"error": True, "message": f"取消异步任务请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -5394,7 +5575,7 @@ async def efile_async_task_list(
     try:
         task_ids_list = json.loads(task_ids)
     except json.JSONDecodeError as exc:
-        return {"error": True, "message": f"task_ids 参数 JSON 解析失败: {exc}"}
+        return {"error": True, "message": f"task_ids 参数 JSON 解析失败 ({type(exc).__name__}): {exc}"}
 
     if not isinstance(task_ids_list, list) or len(task_ids_list) == 0:
         return {"error": True, "message": "task_ids 必须是非空 JSON 数组。"}
@@ -5433,9 +5614,7 @@ async def efile_async_task_list(
         return {"error": True, "message": "未找到有效的文件服务 URL。"}
 
     _cid = str(clusterId) if clusterId is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     try:
         client = _get_http_client(timeout=30.0)
@@ -5457,7 +5636,7 @@ async def efile_async_task_list(
             "status_code": exc.response.status_code,
         }
     except Exception as exc:
-        return {"error": True, "message": f"查询异步任务请求异常: {exc}"}
+        return {"error": True, "message": f"查询异步任务请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -5497,10 +5676,13 @@ async def efile_chunk_upload(
     relative_path: Annotated[str, Field(description="文件相对于 path 的相对路径（包含文件名）")],
     cover: Annotated[str, Field(description="覆盖策略：cover（强制覆盖）或 uncover（不覆盖），默认 uncover")] = "uncover",
     identifier: Annotated[str, Field(description="文件标识，用于关联同一文件的不同分片。无需分片时可为空")] = "",
-    chunk_size: Annotated[int, Field(description="每片字节数，默认 5242880 (5MB)")] = 5242880,
+    chunk_size: Annotated[int, Field(description="每片字节数，默认 52428800 (50MB)，单分片安全值 ≤75 MB")] = 52428800,
     clusterId: Annotated[Optional[int], Field(description="集群 ID。为空时使用默认集群")] = None,
 ) -> dict:
-    """分片上传文件到 HPC 集群文件系统。大文件（>5GB）建议分片上传，每片 5MB。
+    """分片上传文件到 HPC 集群文件系统。推荐分片大小（chunk_size）为 50 MB（安全值）。
+
+    ⚠️ 单分片上限：~79 MB，建议安全值：75 MB。
+    超过建议安全值的单分片可能导致上传失败，请减小 chunk_size。
 
     文件内容通过 base64 编码字符串传入。分片上传完成后需调用 efile_merge_file 合并文件。
     """
@@ -5514,7 +5696,7 @@ async def efile_chunk_upload(
     try:
         file_bytes = _b64decode_stream(file_content)
     except (ValueError, Exception) as exc:
-        msg = str(exc) if isinstance(exc, ValueError) and "文件过大" in str(exc) else f"文件内容 base64 解码失败: {exc}"
+        msg = str(exc) if isinstance(exc, ValueError) and "文件过大" in str(exc) else f"文件内容 base64 解码失败 ({type(exc).__name__}): {exc}"
         return {"error": True, "message": msg}
 
     conn = get_db()
@@ -5551,9 +5733,7 @@ async def efile_chunk_upload(
         return {"error": True, "message": "未找到有效的文件服务 URL。"}
 
     _cid = str(clusterId) if clusterId is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     try:
         client = _get_http_client(timeout=120.0)
@@ -5590,14 +5770,15 @@ async def efile_chunk_upload(
             "status_code": exc.response.status_code,
         }
     except Exception as exc:
-        return {"error": True, "message": f"分片上传请求异常: {exc}"}
+        return {"error": True, "message": f"分片上传请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
         "url": "{efileUrls}/efile/openapi/v2/file/burst",
         "method": "POST",
         "description": (
-            "分片上传文件到 HPC 集群文件系统。大文件（>5GB）建议分片上传，每片 5MB。"
+            "分片上传文件到 HPC 集群文件系统。推荐分片大小（chunk_size）为 50 MB（安全值）。"
+            "⚠️ 单分片上限：~79 MB，建议安全值：75 MB。超过建议安全值可能导致上传失败。"
             "分片上传完成后需调用 efile_merge_file 合并文件。"
         ),
         "parameters": {
@@ -5612,7 +5793,7 @@ async def efile_chunk_upload(
                 "relative_path": {"type": "string", "description": "文件相对 path 的路径（含文件名）", "optional": False},
                 "cover": {"type": "string", "description": "覆盖策略：cover/uncover，默认 uncover", "optional": True},
                 "identifier": {"type": "string", "description": "文件标识，用于关联分片", "optional": True},
-                "chunk_size": {"type": "integer", "description": "每片字节数，默认 5242880 (5MB)", "optional": True},
+                "chunk_size": {"type": "integer", "description": "每片字节数，默认 52428800 (50MB)，单分片安全值 ≤75 MB", "optional": True},
                 "clusterId": {"type": "integer", "description": "集群 ID，为空时使用默认集群", "optional": True},
             },
         },
@@ -5685,9 +5866,7 @@ async def efile_merge_file(
         return {"error": True, "message": "未找到有效的文件服务 URL。"}
 
     _cid = str(clusterId) if clusterId is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     try:
         client = _get_http_client(timeout=30.0)
@@ -5721,7 +5900,7 @@ async def efile_merge_file(
             "status_code": exc.response.status_code,
         }
     except Exception as exc:
-        return {"error": True, "message": f"合并文件请求异常: {exc}"}
+        return {"error": True, "message": f"合并文件请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -5761,9 +5940,11 @@ async def efile_get_upload_config(
 ) -> dict:
     """根据文件大小返回推荐的上传策略和配置参数。
 
-    100MB 以下：直接使用 efile_upload 单次上传。
-    100MB-5GB：使用 efile_chunk_upload 分片上传，返回推荐的分片大小和总数。
-    超过 5GB：返回拒绝提示。
+    实测限制：
+      - 100MB 以下：直接使用 efile_upload 单次上传。
+      - 100MB-5GB：使用 efile_chunk_upload 分片上传（单分片安全值 ≤75 MB）。
+        或使用 efile_batch_chunk_upload 批量上传（每片安全值 ≤8 MB，每批安全值 ≤80 MB）。
+      - 超过 5GB：返回拒绝提示。
     """
     if file_size_bytes > MAX_FILE_SIZE_BYTES:
         return {
@@ -5795,6 +5976,7 @@ async def efile_get_upload_config(
             f"文件 {file_size_bytes / (1024**3):.2f} GB，建议分 {total_chunks} 片上传，"
             f"每片 {chunk_size / (1024**2):.0f} MB（base64 编码后约 {encoded_chunk_size / (1024**2):.0f} MB）。"
             f"推荐每次批量上传 {batch_size} 片，共约 {estimated_batch_calls} 次调用。"
+            f"⚠️ 实测安全值：单分片 ≤75 MB；批量上传（每批最多10片）每片 ≤8 MB，每批总 ≤80 MB。"
         ),
         "recommended_tool": "efile_chunk_upload",
         "chunk_size": chunk_size,
@@ -5826,6 +6008,9 @@ async def efile_batch_chunk_upload(
     内部并行发送各分片请求，大幅减少 Agent 侧的串行调用次数。
     使用前建议先调用 efile_get_upload_config 获取推荐配置。
     所有分片上传完成后需调用 efile_merge_file 合并文件。
+
+    ⚠️ 每片限制：~10 MB/片，总上限：~100 MB/批（10 片）。
+    建议安全值：8 MB/片，总 80 MB/批。超过总上限可能导致批处理失败。
     """
     if total_size > MAX_FILE_SIZE_BYTES:
         return {
@@ -5846,7 +6031,7 @@ async def efile_batch_chunk_upload(
     try:
         chunk_list = json.loads(chunks_json)
     except json.JSONDecodeError as exc:
-        return {"error": True, "message": f"chunks_json 解析失败: {exc}"}
+        return {"error": True, "message": f"chunks_json 解析失败 ({type(exc).__name__}): {exc}"}
 
     if not isinstance(chunk_list, list) or len(chunk_list) == 0:
         return {"error": True, "message": "chunks_json 必须是非空 JSON 数组。"}
@@ -5892,9 +6077,7 @@ async def efile_batch_chunk_upload(
         return {"error": True, "message": "未找到有效的文件服务 URL。"}
 
     _cid = str(clusterId) if clusterId is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     async def _upload_one(chunk: dict) -> dict:
         """Upload a single chunk and return its result."""
@@ -5906,7 +6089,7 @@ async def efile_batch_chunk_upload(
             return {
                 "chunk_number": chunk_number,
                 "success": False,
-                "error": f"base64 解码失败: {exc}",
+                "error": f"base64 解码失败 ({type(exc).__name__}): {exc}",
             }
 
         try:
@@ -5974,7 +6157,7 @@ async def efile_batch_chunk_upload(
     doc = {
         "url": "{efileUrls}/efile/openapi/v2/file/burst",
         "method": "POST",
-        "description": "批量并行上传分片到 HPC 集群（最多 10 片/次）。",
+        "description": "批量并行上传分片到 HPC 集群（最多 10 片/次）。⚠️ 每片限制：~10 MB/片，总上限：~100 MB/批。建议安全值：8 MB/片，总 80 MB/批。",
         "parameters": {
             "format": "URLParameter",
             "schema": {
@@ -6084,9 +6267,7 @@ async def container_create(
         return {"error": True, "message": "未找到有效的 AI 服务 URL。"}
 
     _cid = str(cluster_id) if cluster_id is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     body: dict[str, Any] = {
         "instanceServiceName": instance_service_name,
@@ -6106,8 +6287,7 @@ async def container_create(
         "mountInfoList": mount_list,
         "containerPortInfoList": port_list,
     }
-    if description:
-        body["description"] = description
+    body["description"] = description
 
     try:
         client = _get_http_client(timeout=30.0)
@@ -6129,7 +6309,7 @@ async def container_create(
             "status_code": exc.response.status_code,
         }
     except Exception as exc:
-        return {"error": True, "message": f"创建容器实例请求异常: {exc}"}
+        return {"error": True, "message": f"创建容器实例请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -6220,9 +6400,7 @@ async def container_start(
         return {"error": True, "message": "未找到有效的 AI 服务 URL。"}
 
     _cid = str(cluster_id) if cluster_id is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     try:
         client = _get_http_client(timeout=30.0)
@@ -6244,7 +6422,7 @@ async def container_start(
             "status_code": exc.response.status_code,
         }
     except Exception as exc:
-        return {"error": True, "message": f"启动容器实例请求异常: {exc}"}
+        return {"error": True, "message": f"启动容器实例请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -6323,9 +6501,7 @@ async def container_stop(
         return {"error": True, "message": "未找到有效的 AI 服务 URL。"}
 
     _cid = str(cluster_id) if cluster_id is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     # Build URL with multiple ids params
     params_list = [("ids", i) for i in id_list]
@@ -6350,7 +6526,7 @@ async def container_stop(
             "status_code": exc.response.status_code,
         }
     except Exception as exc:
-        return {"error": True, "message": f"停止容器实例请求异常: {exc}"}
+        return {"error": True, "message": f"停止容器实例请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -6429,9 +6605,7 @@ async def container_delete(
         return {"error": True, "message": "未找到有效的 AI 服务 URL。"}
 
     _cid = str(cluster_id) if cluster_id is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     params_list = [("ids", i) for i in id_list]
     query_string = "&".join(f"{k}={v}" for k, v in params_list)
@@ -6455,7 +6629,7 @@ async def container_delete(
             "status_code": exc.response.status_code,
         }
     except Exception as exc:
-        return {"error": True, "message": f"删除容器实例请求异常: {exc}"}
+        return {"error": True, "message": f"删除容器实例请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -6532,9 +6706,7 @@ async def container_execute(
         return {"error": True, "message": "未找到有效的 AI 服务 URL。"}
 
     _cid = str(cluster_id) if cluster_id is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     try:
         client = _get_http_client(timeout=30.0)
@@ -6560,7 +6732,7 @@ async def container_execute(
             "status_code": exc.response.status_code,
         }
     except Exception as exc:
-        return {"error": True, "message": f"执行脚本请求异常: {exc}"}
+        return {"error": True, "message": f"执行脚本请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -6642,9 +6814,7 @@ async def container_query_list(
         return {"error": True, "message": "未找到有效的 AI 服务 URL。"}
 
     _cid = str(cluster_id) if cluster_id is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     body: dict[str, Any] = {
         "start": start,
@@ -6679,7 +6849,7 @@ async def container_query_list(
             "status_code": exc.response.status_code,
         }
     except Exception as exc:
-        return {"error": True, "message": f"查询容器实例列表请求异常: {exc}"}
+        return {"error": True, "message": f"查询容器实例列表请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -6759,9 +6929,7 @@ async def container_query_url(
         return {"error": True, "message": "未找到有效的 AI 服务 URL。"}
 
     _cid = str(cluster_id) if cluster_id is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     try:
         client = _get_http_client(timeout=30.0)
@@ -6782,7 +6950,7 @@ async def container_query_url(
             "status_code": exc.response.status_code,
         }
     except Exception as exc:
-        return {"error": True, "message": f"获取容器实例 URL 请求异常: {exc}"}
+        return {"error": True, "message": f"获取容器实例 URL 请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -6857,9 +7025,7 @@ async def container_query_detail(
         return {"error": True, "message": "未找到有效的 AI 服务 URL。"}
 
     _cid = str(cluster_id) if cluster_id is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     try:
         client = _get_http_client(timeout=30.0)
@@ -6880,7 +7046,7 @@ async def container_query_detail(
             "status_code": exc.response.status_code,
         }
     except Exception as exc:
-        return {"error": True, "message": f"查询容器实例详情请求异常: {exc}"}
+        return {"error": True, "message": f"查询容器实例详情请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -6958,9 +7124,7 @@ async def container_update_resource(
         return {"error": True, "message": "未找到有效的 AI 服务 URL。"}
 
     _cid = str(cluster_id) if cluster_id is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     try:
         client = _get_http_client(timeout=30.0)
@@ -6987,7 +7151,7 @@ async def container_update_resource(
             "status_code": exc.response.status_code,
         }
     except Exception as exc:
-        return {"error": True, "message": f"更新资源规格请求异常: {exc}"}
+        return {"error": True, "message": f"更新资源规格请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -7066,9 +7230,7 @@ async def container_query_resources(
         return {"error": True, "message": "未找到有效的 AI 服务 URL。"}
 
     _cid = str(cluster_id) if cluster_id is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     try:
         client = _get_http_client(timeout=30.0)
@@ -7090,7 +7252,7 @@ async def container_query_resources(
             "status_code": exc.response.status_code,
         }
     except Exception as exc:
-        return {"error": True, "message": f"查询节点资源限额请求异常: {exc}"}
+        return {"error": True, "message": f"查询节点资源限额请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -7165,9 +7327,7 @@ async def container_query_resource_group(
         return {"error": True, "message": "未找到有效的 AI 服务 URL。"}
 
     _cid = str(cluster_id) if cluster_id is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     try:
         client = _get_http_client(timeout=30.0)
@@ -7188,7 +7348,7 @@ async def container_query_resource_group(
             "status_code": exc.response.status_code,
         }
     except Exception as exc:
-        return {"error": True, "message": f"查询资源分组请求异常: {exc}"}
+        return {"error": True, "message": f"查询资源分组请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -7261,9 +7421,7 @@ async def container_query_allowed_mount_dir(
         return {"error": True, "message": "未找到有效的 AI 服务 URL。"}
 
     _cid = str(cluster_id) if cluster_id is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     try:
         client = _get_http_client(timeout=30.0)
@@ -7284,7 +7442,7 @@ async def container_query_allowed_mount_dir(
             "status_code": exc.response.status_code,
         }
     except Exception as exc:
-        return {"error": True, "message": f"查询授权挂载路径请求异常: {exc}"}
+        return {"error": True, "message": f"查询授权挂载路径请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -7368,9 +7526,7 @@ async def container_get_images(
         return {"error": True, "message": "未找到有效的 AI 服务 URL。"}
 
     _cid = str(cluster_id) if cluster_id is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     body: dict[str, Any] = {
         "access": access,
@@ -7406,7 +7562,7 @@ async def container_get_images(
             "status_code": exc.response.status_code,
         }
     except Exception as exc:
-        return {"error": True, "message": f"获取镜像列表请求异常: {exc}"}
+        return {"error": True, "message": f"获取镜像列表请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -7488,7 +7644,7 @@ async def notebook_list_resources(
             "status_code": exc.response.status_code,
         }
     except Exception as exc:
-        return {"error": True, "message": f"查询资源信息请求异常: {exc}"}
+        return {"error": True, "message": f"查询资源信息请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -7583,7 +7739,7 @@ async def notebook_create(
             "status_code": exc.response.status_code,
         }
     except Exception as exc:
-        return {"error": True, "message": f"创建 Notebook 请求异常: {exc}"}
+        return {"error": True, "message": f"创建 Notebook 请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -7655,7 +7811,7 @@ async def notebook_start(
             "status_code": exc.response.status_code,
         }
     except Exception as exc:
-        return {"error": True, "message": f"启动 Notebook 请求异常: {exc}"}
+        return {"error": True, "message": f"启动 Notebook 请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -7731,9 +7887,7 @@ async def notebook_list(
         return {"error": True, "message": "未找到有效的 AI 服务 URL。"}
 
     _cid = str(cluster_id) if cluster_id is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     params: dict[str, Any] = {}
     if notebook_name:
@@ -7760,7 +7914,7 @@ async def notebook_list(
             "status_code": exc.response.status_code,
         }
     except Exception as exc:
-        return {"error": True, "message": f"查询 Notebook 列表请求异常: {exc}"}
+        return {"error": True, "message": f"查询 Notebook 列表请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -7840,9 +7994,7 @@ async def notebook_detail(
         return {"error": True, "message": "未找到有效的 AI 服务 URL。"}
 
     _cid = str(cluster_id) if cluster_id is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     try:
         client = _get_http_client(timeout=30.0)
@@ -7861,7 +8013,7 @@ async def notebook_detail(
             "status_code": exc.response.status_code,
         }
     except Exception as exc:
-        return {"error": True, "message": f"查询 Notebook 详情请求异常: {exc}"}
+        return {"error": True, "message": f"查询 Notebook 详情请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -7939,9 +8091,7 @@ async def notebook_stop(
         return {"error": True, "message": "未找到有效的 AI 服务 URL。"}
 
     _cid = str(cluster_id) if cluster_id is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     try:
         client = _get_http_client(timeout=30.0)
@@ -7960,7 +8110,7 @@ async def notebook_stop(
             "status_code": exc.response.status_code,
         }
     except Exception as exc:
-        return {"error": True, "message": f"关机 Notebook 请求异常: {exc}"}
+        return {"error": True, "message": f"关机 Notebook 请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -8038,9 +8188,7 @@ async def notebook_release(
         return {"error": True, "message": "未找到有效的 AI 服务 URL。"}
 
     _cid = str(cluster_id) if cluster_id is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     try:
         client = _get_http_client(timeout=30.0)
@@ -8059,7 +8207,7 @@ async def notebook_release(
             "status_code": exc.response.status_code,
         }
     except Exception as exc:
-        return {"error": True, "message": f"释放 Notebook 请求异常: {exc}"}
+        return {"error": True, "message": f"释放 Notebook 请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -8139,9 +8287,7 @@ async def notebook_rename(
         return {"error": True, "message": "未找到有效的 AI 服务 URL。"}
 
     _cid = str(cluster_id) if cluster_id is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     try:
         client = _get_http_client(timeout=30.0)
@@ -8160,7 +8306,7 @@ async def notebook_rename(
             "status_code": exc.response.status_code,
         }
     except Exception as exc:
-        return {"error": True, "message": f"重命名 Notebook 请求异常: {exc}"}
+        return {"error": True, "message": f"重命名 Notebook 请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -8242,9 +8388,7 @@ async def notebook_list_images(
         return {"error": True, "message": "未找到有效的 AI 服务 URL。"}
 
     _cid = str(cluster_id) if cluster_id is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     body: dict[str, Any] = {}
     if name:
@@ -8279,7 +8423,7 @@ async def notebook_list_images(
             "status_code": exc.response.status_code,
         }
     except Exception as exc:
-        return {"error": True, "message": f"查询镜像列表请求异常: {exc}"}
+        return {"error": True, "message": f"查询镜像列表请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -8363,9 +8507,7 @@ async def notebook_list_model_images(
         return {"error": True, "message": "未找到有效的 AI 服务 URL。"}
 
     _cid = str(cluster_id) if cluster_id is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     body: dict[str, Any] = {"page": page, "size": size}
     if accelerator_type:
@@ -8388,7 +8530,7 @@ async def notebook_list_model_images(
             "status_code": exc.response.status_code,
         }
     except Exception as exc:
-        return {"error": True, "message": f"查询模型镜像列表请求异常: {exc}"}
+        return {"error": True, "message": f"查询模型镜像列表请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -8467,9 +8609,7 @@ async def notebook_query_jupyter_url(
         return {"error": True, "message": "未找到有效的 AI 服务 URL。"}
 
     _cid = str(cluster_id) if cluster_id is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     try:
         client = _get_http_client(timeout=30.0)
@@ -8488,7 +8628,7 @@ async def notebook_query_jupyter_url(
             "status_code": exc.response.status_code,
         }
     except Exception as exc:
-        return {"error": True, "message": f"查询 Jupyter 地址请求异常: {exc}"}
+        return {"error": True, "message": f"查询 Jupyter 地址请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -8565,9 +8705,7 @@ async def notebook_query_custom_service_url(
         return {"error": True, "message": "未找到有效的 AI 服务 URL。"}
 
     _cid = str(cluster_id) if cluster_id is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     try:
         client = _get_http_client(timeout=30.0)
@@ -8586,7 +8724,7 @@ async def notebook_query_custom_service_url(
             "status_code": exc.response.status_code,
         }
     except Exception as exc:
-        return {"error": True, "message": f"查询自定义服务地址请求异常: {exc}"}
+        return {"error": True, "message": f"查询自定义服务地址请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
@@ -8668,9 +8806,7 @@ async def notebook_start_custom_service(
         return {"error": True, "message": "未找到有效的 AI 服务 URL。"}
 
     _cid = str(cluster_id) if cluster_id is not None else "default"
-    _idx = _url_idx_ctx.get(_cid, 0)
-    base_url = valid_urls[_idx % len(valid_urls)]
-    _url_idx_ctx[_cid] = _idx + 1
+    base_url, _ = _pick_url(valid_urls, _cid)
 
     body: dict[str, Any] = {"id": notebook_id, "customizePort": customize_port}
     if command:
@@ -8693,7 +8829,7 @@ async def notebook_start_custom_service(
             "status_code": exc.response.status_code,
         }
     except Exception as exc:
-        return {"error": True, "message": f"启动自定义服务请求异常: {exc}"}
+        return {"error": True, "message": f"启动自定义服务请求异常 ({type(exc).__name__}): {exc}"}
 
     returns_schema = _build_return_schema(result if isinstance(result, dict) else {})
     doc = {
