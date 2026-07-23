@@ -415,7 +415,7 @@ def migrate_db() -> None:
 AUTH_PREFIX = os.environ.get("MCP_AUTH_PREFIX", "auth")
 AUTH_BASE_URL = os.environ.get(
     "MCP_AUTH_BASE_URL",
-    "https://c-2056205187675406338.qdai.scnet.cn:58043"
+    "https://31302e32312e302e32303a38313036.whai.scnet.cn:59046"
 )
 
 AUTH_PAGE_ROUTE = f"/{AUTH_PREFIX}/"
